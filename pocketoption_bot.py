@@ -100,6 +100,11 @@ QT_MODE_CHECKED_ONCE = False  # only force-check the $/% toggle once per run, no
 QT_ASSET_SYNCED = False       # True once the bot has learned which chart is on screen at startup
 QT_AUTO_CONTINUE = False      # set once the user picks 'A' - skips future Y/N/A prompts entirely
 
+# --- Normal-mode smart filters (Quick Trade ignores these) ---
+NORMAL_LOSS_COOLDOWN_UNTIL = datetime(2000, 1, 1)
+NORMAL_TRADED_CANDLE_TS = {}   # asset -> candle timestamp already traded this candle
+_FILTER_SKIP_LOG_AT = {}       # throttle skip logs
+
 
 async def set_remote_debugging_allowed():
     os_platform = platform.platform().lower()
@@ -599,6 +604,8 @@ async def supertrend_strategy(candles, action, sstrategy=None):
 
 
 async def get_price_action(candles, action):
+    if len(candles) < 3:
+        return None
     if action == 'call':
         if candles[-1][2] > candles[-3][2]:
             return action
@@ -606,6 +613,72 @@ async def get_price_action(candles, action):
         if candles[-1][2] < candles[-3][2]:
             return action
     return None
+
+
+def trend_agrees(candles, action, lookback=3):
+    """True when the last `lookback` closed steps all move with the signal."""
+    need = lookback + 1
+    if len(candles) < need:
+        return False
+    closes = [c[2] for c in candles[-need:]]
+    if action == 'call':
+        return all(closes[i] < closes[i + 1] for i in range(lookback))
+    if action == 'put':
+        return all(closes[i] > closes[i + 1] for i in range(lookback))
+    return False
+
+
+def _log_filter_skip(asset, reason):
+    key = f'{asset}:{reason}'
+    now = datetime.now()
+    last = _FILTER_SKIP_LOG_AT.get(key)
+    if last and now - last < timedelta(seconds=30):
+        return
+    _FILTER_SKIP_LOG_AT[key] = now
+    label = asset or '?'
+    log(f'Smart filter skip {label}: {reason}')
+
+
+async def apply_normal_smart_filters(candles, action, asset=None):
+    """Extra selectivity for Normal mode. Returns action or None."""
+    if not SETTINGS.get('SMART_FILTERS_ENABLED', True):
+        return action
+    if not action:
+        return None
+
+    if SETTINGS.get('TREND_FILTER_ENABLED', True):
+        lookback = max(2, int(SETTINGS.get('TREND_LOOKBACK', 3)))
+        if not trend_agrees(candles, action, lookback):
+            _log_filter_skip(asset, f'trend (need {lookback} agreeing closes)')
+            return None
+
+    if SETTINGS.get('PRICE_ACTION_FILTER', True):
+        if not await get_price_action(candles, action):
+            _log_filter_skip(asset, 'price-action confluence')
+            return None
+
+    return action
+
+
+def normal_smart_filters_blocking():
+    """Global Normal-mode blocks (loss cooldown). Quick Trade must not call this."""
+    if not SETTINGS.get('SMART_FILTERS_ENABLED', True):
+        return False
+    return datetime.now() < NORMAL_LOSS_COOLDOWN_UNTIL
+
+
+def note_normal_trade_outcome(outcome):
+    """Start a cooldown after Normal-mode losses so the bot does not revenge-trade."""
+    global NORMAL_LOSS_COOLDOWN_UNTIL
+    if not SETTINGS.get('SMART_FILTERS_ENABLED', True):
+        return
+    if outcome != 'LOSS':
+        return
+    secs = max(0, int(SETTINGS.get('LOSS_COOLDOWN_SECONDS', 90)))
+    if secs <= 0:
+        return
+    NORMAL_LOSS_COOLDOWN_UNTIL = datetime.now() + timedelta(seconds=secs)
+    log(f'Smart filter: loss cooldown {secs}s before next Normal trade')
 
 
 async def set_amount_icon(driver):
@@ -695,7 +768,7 @@ async def get_balance_robust(driver):
     return 0.0
 
 async def check_indicators(driver):
-    global MARTINGALE_LAST_ACTION_ENDS_AT, MARTINGALE_AMOUNT_SET, MARTINGALE_INITIAL, LAST_CANDLE_TS, TRADE_BALANCE_BEFORE, TRADE_BET_AMOUNT, MARTINGALE_INDEX, BASE_BET
+    global MARTINGALE_LAST_ACTION_ENDS_AT, MARTINGALE_AMOUNT_SET, MARTINGALE_INITIAL, LAST_CANDLE_TS, TRADE_BALANCE_BEFORE, TRADE_BET_AMOUNT, MARTINGALE_INDEX, BASE_BET, NORMAL_TRADED_CANDLE_TS
     MARTINGALE_LIST = SETTINGS.get('MARTINGALE_LIST')
     use_list = bool(SETTINGS.get('MARTINGALE_ENABLED'))
     multiplier = float(SETTINGS.get('MULTIPLIER', 2.3))
@@ -771,6 +844,7 @@ async def check_indicators(driver):
             else:
                 outcome = 'DRAW'
             log(f"Outcome: {outcome_emo(outcome)} {outcome}")
+            note_normal_trade_outcome(outcome)
 
         if use_list:
             if outcome == 'WIN':
@@ -823,12 +897,20 @@ async def check_indicators(driver):
 
     action = None
     sstrategy = None
+    if normal_smart_filters_blocking():
+        return
     for asset, candles in CANDLES.items():
         if SETTINGS.get('BEGINNING_CANDLE_ORDER'):
             current_ts = candles[-1][0] if candles else None
             if not current_ts or current_ts == LAST_CANDLE_TS.get(asset):
                 continue
             LAST_CANDLE_TS[asset] = current_ts
+        current_ts = candles[-1][0] if candles else None
+        if (SETTINGS.get('SMART_FILTERS_ENABLED', True)
+                and SETTINGS.get('ONE_TRADE_PER_CANDLE', True)
+                and current_ts
+                and NORMAL_TRADED_CANDLE_TS.get(asset) == current_ts):
+            continue
         if SETTINGS.get('USE_SERVER_STRATEGIES') and \
                 asset in SERVER_STRATEGIES and \
                 len(SERVER_STRATEGIES[asset]) > 0 and \
@@ -844,6 +926,8 @@ async def check_indicators(driver):
         _bal_before_trade = await get_balance(driver)
         order_created = await create_order(driver, action, asset, sstrategy=sstrategy)
         if order_created:
+            if current_ts:
+                NORMAL_TRADED_CANDLE_TS[asset] = current_ts
             try:
                 await set_estimation_icon(driver)  # actually, it's just a check
                 seconds = await get_estimation(driver)
@@ -1276,9 +1360,10 @@ async def check_strategies(candles, sstrategy=None):
         if not action:
             return
 
-    # action = await get_price_action(candles, action)
-    # if not action:
-    #     return  # secret ingredient
+    # Normal-mode smart filters (trend + price-action). Skipped when disabled in settings.
+    action = await apply_normal_smart_filters(candles, action, asset=None)
+    if not action:
+        return
     return action
 
 
@@ -1691,6 +1776,12 @@ def tkinter_run():
     chk_begin = ctk.IntVar(value=1 if SETTINGS.get('BEGINNING_CANDLE_ORDER', False) else 0)
     chk_mar = ctk.IntVar(value=1 if SETTINGS.get('MARTINGALE_ENABLED', False) else 0)
     chk_qt_tp_var = ctk.IntVar(value=1 if SETTINGS.get('QT_TAKE_PROFIT_ENABLED', False) else 0)
+    chk_smart_var = ctk.IntVar(value=1 if SETTINGS.get('SMART_FILTERS_ENABLED', True) else 0)
+    chk_trend_var = ctk.IntVar(value=1 if SETTINGS.get('TREND_FILTER_ENABLED', True) else 0)
+    chk_pa_var = ctk.IntVar(value=1 if SETTINGS.get('PRICE_ACTION_FILTER', True) else 0)
+    chk_otpc_var = ctk.IntVar(value=1 if SETTINGS.get('ONE_TRADE_PER_CANDLE', True) else 0)
+    trend_lookback_val = ctk.StringVar(value=str(SETTINGS.get('TREND_LOOKBACK', 3)))
+    loss_cooldown_val = ctk.StringVar(value=str(SETTINGS.get('LOSS_COOLDOWN_SECONDS', 90)))
 
     # ---- panels row ----
     top = ctk.CTkFrame(window, fg_color='transparent')
@@ -1804,6 +1895,21 @@ def tkinter_run():
     L(col_o, 'Chrome version').grid(row=7, column=0, sticky='w')
     ent_chrome_version = E(col_o, chrome_version_val, width=54)
     ent_chrome_version.grid(row=7, column=1, sticky='e', pady=2)
+
+    L(col_o, 'Smart filters', bold=True).grid(row=8, column=0, columnspan=2, sticky='w', pady=(12, 4))
+    chk_smart = CH(col_o, chk_smart_var, 'Enable smart filters')
+    chk_smart.grid(row=9, column=0, columnspan=2, sticky='w', pady=2)
+    chk_trend = CH(col_o, chk_trend_var, 'Trend lookback')
+    chk_trend.grid(row=10, column=0, sticky='w', pady=2)
+    ent_trend_lookback = E(col_o, trend_lookback_val, width=54)
+    ent_trend_lookback.grid(row=10, column=1, sticky='e', pady=2)
+    chk_pa = CH(col_o, chk_pa_var, 'Price-action confluence')
+    chk_pa.grid(row=11, column=0, columnspan=2, sticky='w', pady=2)
+    chk_otpc = CH(col_o, chk_otpc_var, 'One trade per candle')
+    chk_otpc.grid(row=12, column=0, columnspan=2, sticky='w', pady=2)
+    L(col_o, 'Loss cooldown s').grid(row=13, column=0, sticky='w')
+    ent_loss_cd = E(col_o, loss_cooldown_val, width=54)
+    ent_loss_cd.grid(row=13, column=1, sticky='e', pady=2)
 
     # --- Martingale column ---
     col_m = ctk.CTkFrame(normal_content, fg_color='transparent')
@@ -2063,6 +2169,11 @@ def tkinter_run():
             error_variable.set('Supertrend period: should be number 1-99'); return
         if not validate_int(chrome_version_val.get(), 80, 999):
             error_variable.set('Chrome version: should be number 80-999'); return
+        if chk_smart_var.get():
+            if not validate_int(trend_lookback_val.get(), 2, 20):
+                error_variable.set('Trend lookback: should be number 2-20'); return
+            if not validate_int(loss_cooldown_val.get(), 0, 3600):
+                error_variable.set('Loss cooldown: should be number 0-3600'); return
         if mode_var.get() == 'quick':
             if not validate_int(qt_fast_ma_val.get(), 1, 99):
                 error_variable.set('Quick Trade Fast MA: should be number 1-99'); return
@@ -2119,6 +2230,12 @@ def tkinter_run():
             CHROME_VERSION=int(chrome_version_val.get()),
             MULTIPLIER=float(multiplier_gui_val.get()),
             MIN_BET_AMOUNT=int(min_bet_gui_val.get()),
+            SMART_FILTERS_ENABLED=True if chk_smart_var.get() else False,
+            TREND_FILTER_ENABLED=True if chk_trend_var.get() else False,
+            TREND_LOOKBACK=int(trend_lookback_val.get()),
+            PRICE_ACTION_FILTER=True if chk_pa_var.get() else False,
+            ONE_TRADE_PER_CANDLE=True if chk_otpc_var.get() else False,
+            LOSS_COOLDOWN_SECONDS=int(loss_cooldown_val.get()),
             TRADING_MODE=mode_var.get(),
             QT_FAST_MA=int(qt_fast_ma_val.get()),
             QT_SLOW_MA=int(qt_slow_ma_val.get()),

@@ -70,6 +70,12 @@ _DEFAULTS = {
     'STOP_LOSS_ENABLED':    False,
     'STOP_LOSS':            50,
     'SOCKET_DEBUG':         False,
+    'SMART_FILTERS_ENABLED': True,
+    'TREND_FILTER_ENABLED': True,
+    'TREND_LOOKBACK':       3,
+    'PRICE_ACTION_FILTER':  True,
+    'ONE_TRADE_PER_CANDLE': True,
+    'LOSS_COOLDOWN_SECONDS': 90,
     'TRADING_MODE':         'normal',
     'QT_FAST_MA':           5,
     'QT_SLOW_MA':           10,
@@ -108,6 +114,8 @@ def load_settings():
         SUPERTREND_ENABLED, SUPERTREND_PERIOD, \
         TAKE_PROFIT_ENABLED, TAKE_PROFIT, STOP_LOSS_ENABLED, STOP_LOSS, \
         SOCKET_DEBUG, \
+        SMART_FILTERS_ENABLED, TREND_FILTER_ENABLED, TREND_LOOKBACK, \
+        PRICE_ACTION_FILTER, ONE_TRADE_PER_CANDLE, LOSS_COOLDOWN_SECONDS, \
         TRADING_MODE, QT_FAST_MA, QT_SLOW_MA, QT_MA_TYPE, QT_TRADE_AMOUNT, \
         QT_MARTINGALE, QT_MAX_STEPS, QT_SESSIONS, QT_TAKE_PROFIT_ENABLED, \
         QT_TAKE_PROFIT, QT_MIN_PAYOUT, QT_EXPIRY_SECONDS, QT_AUTO_CONTINUE
@@ -155,6 +163,12 @@ def load_settings():
     STOP_LOSS_ENABLED   = bool(values['STOP_LOSS_ENABLED'])
     STOP_LOSS           = float(values['STOP_LOSS'])
     SOCKET_DEBUG        = bool(values['SOCKET_DEBUG'])
+    SMART_FILTERS_ENABLED = bool(values['SMART_FILTERS_ENABLED'])
+    TREND_FILTER_ENABLED = bool(values['TREND_FILTER_ENABLED'])
+    TREND_LOOKBACK      = int(values['TREND_LOOKBACK'])
+    PRICE_ACTION_FILTER = bool(values['PRICE_ACTION_FILTER'])
+    ONE_TRADE_PER_CANDLE = bool(values['ONE_TRADE_PER_CANDLE'])
+    LOSS_COOLDOWN_SECONDS = int(values['LOSS_COOLDOWN_SECONDS'])
     TRADING_MODE        = str(values['TRADING_MODE'])
     QT_FAST_MA          = int(values['QT_FAST_MA'])
     QT_SLOW_MA          = int(values['QT_SLOW_MA'])
@@ -182,6 +196,9 @@ TRADING_ALLOWED  = True
 INITIAL_DEPOSIT  = None
 MARTINGALE_STEP  = 0
 LAST_TRADE_AT    = datetime(2000, 1, 1)
+NORMAL_LOSS_COOLDOWN_UNTIL = datetime(2000, 1, 1)
+NORMAL_TRADED_CANDLE_TS = {}
+_FILTER_SKIP_LOG_AT = {}
 _LOG_SEEN        = 0
 _WS_VERBOSE      = False          # set True to re-enable [ws]/[sniff] diagnostics
 _SNIFF_SEEN      = set()
@@ -553,6 +570,70 @@ async def bollinger_bands_strategy(candles):
     return None
 
 
+async def get_price_action(candles, action):
+    if len(candles) < 3:
+        return None
+    if action == 'call':
+        if candles[-1][2] > candles[-3][2]:
+            return action
+    elif action == 'put':
+        if candles[-1][2] < candles[-3][2]:
+            return action
+    return None
+
+
+def trend_agrees(candles, action, lookback=3):
+    need = lookback + 1
+    if len(candles) < need:
+        return False
+    closes = [c[2] for c in candles[-need:]]
+    if action == 'call':
+        return all(closes[i] < closes[i + 1] for i in range(lookback))
+    if action == 'put':
+        return all(closes[i] > closes[i + 1] for i in range(lookback))
+    return False
+
+
+def _log_filter_skip(asset, reason):
+    key = f'{asset}:{reason}'
+    now = datetime.now()
+    last = _FILTER_SKIP_LOG_AT.get(key)
+    if last and now - last < timedelta(seconds=30):
+        return
+    _FILTER_SKIP_LOG_AT[key] = now
+    log(f'Smart filter skip {asset or "?"}: {reason}')
+
+
+async def apply_normal_smart_filters(candles, action, asset=None):
+    if not SMART_FILTERS_ENABLED:
+        return action
+    if not action:
+        return None
+    if TREND_FILTER_ENABLED:
+        lookback = max(2, int(TREND_LOOKBACK))
+        if not trend_agrees(candles, action, lookback):
+            _log_filter_skip(asset, f'trend (need {lookback} agreeing closes)')
+            return None
+    if PRICE_ACTION_FILTER:
+        if not await get_price_action(candles, action):
+            _log_filter_skip(asset, 'price-action confluence')
+            return None
+    return action
+
+
+def note_normal_trade_outcome(outcome):
+    global NORMAL_LOSS_COOLDOWN_UNTIL
+    if not SMART_FILTERS_ENABLED:
+        return
+    if outcome != 'LOSS':
+        return
+    secs = max(0, int(LOSS_COOLDOWN_SECONDS))
+    if secs <= 0:
+        return
+    NORMAL_LOSS_COOLDOWN_UNTIL = datetime.now() + timedelta(seconds=secs)
+    log(f'Smart filter: loss cooldown {secs}s before next Normal trade')
+
+
 async def check_strategies(candles):
     if STRATEGY == 6:
         action = await bollinger_bands_strategy(candles)
@@ -587,6 +668,10 @@ def min_candles_needed():
     if STRATEGY == 2:   need = max(need, 22)
     if RSI_ENABLED:         need = max(need, RSI_PERIOD + 2)
     if SUPERTREND_ENABLED:  need = max(need, SUPERTREND_PERIOD + 2)
+    if SMART_FILTERS_ENABLED and TREND_FILTER_ENABLED:
+        need = max(need, int(TREND_LOOKBACK) + 2)
+    if SMART_FILTERS_ENABLED and PRICE_ACTION_FILTER:
+        need = max(need, 3)
     return need
 
 
@@ -965,10 +1050,12 @@ async def score_result(before, after, bet):
 
 async def try_trade(driver):
     """Look for a signal on the selected pair and place one trade."""
-    global MARTINGALE_STEP, LAST_TRADE_AT
+    global MARTINGALE_STEP, LAST_TRADE_AT, NORMAL_TRADED_CANDLE_TS
 
     # Cooldown so we don't fire two trades within one expiry.
     if datetime.now() < LAST_TRADE_AT + timedelta(seconds=EXPIRY_SECONDS + 2):
+        return
+    if SMART_FILTERS_ENABLED and datetime.now() < NORMAL_LOSS_COOLDOWN_UNTIL:
         return
 
     asset = await read_selected_pair(driver)
@@ -982,7 +1069,18 @@ async def try_trade(driver):
     closed = candles[:-1]
     if len(closed) < min_candles_needed():
         return
+    if SMART_FILTERS_ENABLED:
+        lookback = max(2, int(TREND_LOOKBACK))
+        if len(closed) < lookback + 1:
+            return
+    current_ts = closed[-1][0] if closed else None
+    if (SMART_FILTERS_ENABLED and ONE_TRADE_PER_CANDLE
+            and current_ts and NORMAL_TRADED_CANDLE_TS.get(asset) == current_ts):
+        return
     action = await check_strategies(closed)
+    if not action:
+        return
+    action = await apply_normal_smart_filters(closed, action, asset=asset)
     if not action:
         return
     if VICE_VERSA:
@@ -1030,6 +1128,8 @@ async def try_trade(driver):
     if not await place_order(driver, action):
         return
     LAST_TRADE_AT = datetime.now()
+    if current_ts:
+        NORMAL_TRADED_CANDLE_TS[asset] = current_ts
 
     # Sleep the full expiry (+ small buffer); keeps draining socket logs
     # meanwhile so other assets' candles keep building.
@@ -1048,6 +1148,7 @@ async def try_trade(driver):
                 f'text={latest["text"][:120]!r}')
             globals()['_FIRST_RESULT_LOGGED'] = True
         log(f'← {outcome_emo(outcome)} {outcome} | delta {delta:+.2f}')
+        note_normal_trade_outcome(outcome)
         if INITIAL_DEPOSIT and bal_after:
             pnl = bal_after - INITIAL_DEPOSIT
             log(f'  Balance: {bal_after:.2f} | Run P/L: {pnl:+.2f} {total_emo(pnl)}')
@@ -1059,6 +1160,7 @@ async def try_trade(driver):
             return
         outcome, delta = await score_result(bal_before, bal_after, amount)
         log(f'← {outcome_emo(outcome)} {outcome} (balance fallback) | delta {delta:+.2f}')
+        note_normal_trade_outcome(outcome)
 
     if outcome == 'WIN':
         MARTINGALE_STEP = 0

@@ -35,6 +35,8 @@ SETTING_KEYS = [
     'SUPERTREND_ENABLED', 'SUPERTREND_PERIOD',
     'TAKE_PROFIT_ENABLED', 'TAKE_PROFIT', 'STOP_LOSS_ENABLED', 'STOP_LOSS',
     'SOCKET_DEBUG',
+    'SMART_FILTERS_ENABLED', 'TREND_FILTER_ENABLED', 'TREND_LOOKBACK',
+    'PRICE_ACTION_FILTER', 'ONE_TRADE_PER_CANDLE', 'LOSS_COOLDOWN_SECONDS',
     'TRADING_MODE',
     'QT_FAST_MA', 'QT_SLOW_MA', 'QT_MA_TYPE', 'QT_TRADE_AMOUNT',
     'QT_MARTINGALE', 'QT_MAX_STEPS', 'QT_SESSIONS',
@@ -71,6 +73,12 @@ DEFAULTS = {
     'STOP_LOSS_ENABLED':    False,
     'STOP_LOSS':            50,
     'SOCKET_DEBUG':         False,
+    'SMART_FILTERS_ENABLED': True,
+    'TREND_FILTER_ENABLED': True,
+    'TREND_LOOKBACK':       3,
+    'PRICE_ACTION_FILTER':  True,
+    'ONE_TRADE_PER_CANDLE': True,
+    'LOSS_COOLDOWN_SECONDS': 90,
     'TRADING_MODE':         'normal',
     'QT_FAST_MA':           5,
     'QT_SLOW_MA':           10,
@@ -397,6 +405,20 @@ class App:
         self._check(col_o, 'SOCKET_DEBUG', 'Log every socket frame').grid(
             row=7, column=0, columnspan=2, sticky='w', pady=4)
 
+        self._label(col_o, 'Smart filters', bold=True).grid(
+            row=8, column=0, columnspan=2, sticky='w', pady=(12, 4))
+        self._check(col_o, 'SMART_FILTERS_ENABLED', 'Enable smart filters').grid(
+            row=9, column=0, columnspan=2, sticky='w', pady=2)
+        self._check(col_o, 'TREND_FILTER_ENABLED', 'Trend lookback').grid(
+            row=10, column=0, sticky='w', pady=2)
+        self._entry(col_o, 'TREND_LOOKBACK', width=54).grid(row=10, column=1, sticky='e', pady=2)
+        self._check(col_o, 'PRICE_ACTION_FILTER', 'Price-action confluence').grid(
+            row=11, column=0, columnspan=2, sticky='w', pady=2)
+        self._check(col_o, 'ONE_TRADE_PER_CANDLE', 'One trade per candle').grid(
+            row=12, column=0, columnspan=2, sticky='w', pady=2)
+        self._label(col_o, 'Loss cooldown s').grid(row=13, column=0, sticky='w')
+        self._entry(col_o, 'LOSS_COOLDOWN_SECONDS', width=54).grid(row=13, column=1, sticky='e', pady=2)
+
         # ---- Martingale column ----
         col_m = ctk.CTkFrame(content, fg_color='transparent')
         col_m.grid(row=0, column=2, sticky='nw')
@@ -523,6 +545,7 @@ class App:
                   'FAST_MA', 'SLOW_MA', 'VORTEX_PERIOD', 'MARUBOZU_MIN_BODY',
                   'CCI_PERIOD', 'BB_PERIOD', 'RSI_PERIOD', 'RSI_UPPER',
                   'SUPERTREND_PERIOD', 'TAKE_PROFIT', 'STOP_LOSS',
+                  'TREND_LOOKBACK', 'LOSS_COOLDOWN_SECONDS',
                   'QT_FAST_MA', 'QT_SLOW_MA', 'QT_TRADE_AMOUNT',
                   'QT_MAX_STEPS', 'QT_SESSIONS', 'QT_TAKE_PROFIT',
                   'QT_MIN_PAYOUT']:
@@ -533,6 +556,8 @@ class App:
             s[k] = self._v(k).get()
         for k in ['VICE_VERSA', 'RSI_ENABLED', 'SUPERTREND_ENABLED',
                   'TAKE_PROFIT_ENABLED', 'STOP_LOSS_ENABLED', 'SOCKET_DEBUG',
+                  'SMART_FILTERS_ENABLED', 'TREND_FILTER_ENABLED',
+                  'PRICE_ACTION_FILTER', 'ONE_TRADE_PER_CANDLE',
                   'QT_TAKE_PROFIT_ENABLED', 'QT_AUTO_CONTINUE']:
             s[k] = bool(self._b(k).get())
         s['STRATEGY'] = STRATEGIES.get(self.strategy_var.get(), 1)
@@ -550,6 +575,11 @@ class App:
             raise ValueError('Max martingale steps must be >= 1')
         if s['CANDLE_PERIOD'] < 1:
             raise ValueError('Candle period must be >= 1 second')
+        if s['SMART_FILTERS_ENABLED']:
+            if s['TREND_LOOKBACK'] < 2 or s['TREND_LOOKBACK'] > 20:
+                raise ValueError('Trend lookback must be 2-20')
+            if s['LOSS_COOLDOWN_SECONDS'] < 0 or s['LOSS_COOLDOWN_SECONDS'] > 3600:
+                raise ValueError('Loss cooldown must be 0-3600')
         if s['TRADING_MODE'] == 'quick':
             if s['QT_FAST_MA'] >= s['QT_SLOW_MA']:
                 raise ValueError('QT: Fast MA must be less than Slow MA')
