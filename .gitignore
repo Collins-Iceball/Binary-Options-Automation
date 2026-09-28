@@ -1,4 +1,25 @@
 .idea/
 __pycache__/
-data*/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+*.deb
+last_url.txt
+*.log
+.DS_Store
+
+# Local Chrome / junk
+python3
+fix_indent_normalize.py
+patch_chrome_version.py.csv
+
+# Archives / one-off patches (not part of the product)
+Backup/
+Default/
+fixes/
 default/*
+
+# Regenerable / large local data (keep samples out of git by default)
+data*/

@@ -1,7 +1,54 @@
-pandas
-requests
-#scikit-learn
-selenium
-setuptools
-#stock-indicators
-undetected-chromedriver
+# Binary Options Automation — Collins_Obi
+# https://github.com/Collins-Iceball/Binary-Options-Automation
+#
+# Install:  pip install -r requirements.txt
+# Also needs: Google Chrome + .NET 6+ (for stock-indicators / pythonnet)
+
+# --- Core automation ---
+selenium==4.49.0
+undetected-chromedriver==3.5.5
+requests==2.34.2
+setuptools==84.0.0
+urllib3==2.8.0
+websocket-client==1.9.2
+websockets==17.1
+certifi==2026.7.22
+charset-normalizer==3.5.1
+idna==3.20
+attrs==26.1.0
+outcome==1.3.0.post0
+PySocks==1.7.1
+sniffio==1.3.1
+sortedcontainers==2.4.0
+trio==0.34.0
+trio-websocket==0.12.2
+wsproto==1.3.2
+h11==0.16.0
+typing_extensions==4.16.0
+cffi==2.1.1
+pycparser==3.0
+packaging==26.3
+
+# --- Data / indicators (.NET 6+ required) ---
+pandas==3.0.6
+numpy==2.5.3
+python-dateutil==2.9.0.post0
+six==1.17.0
+stock-indicators==1.3.5
+pythonnet==3.1.0
+clr_loader==0.3.1
+
+# --- GUI + launcher dashboard ---
+customtkinter==6.0.0
+darkdetect==0.8.0
+matplotlib==3.11.2
+contourpy==1.4.0
+cycler==0.12.1
+fonttools==4.65.0
+kiwisolver==1.5.1
+pillow==12.3.0
+pyparsing==3.3.3
+
+# --- Optional (uncomment if you use these scripts) ---
+# yfinance          # test_on_historical_data.py / live history fetch
+# scikit-learn      # po_bot_ml.py

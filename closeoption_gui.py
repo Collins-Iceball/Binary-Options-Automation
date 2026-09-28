@@ -1,0 +1,709 @@
+"""
+closeoption_gui.py - CustomTkinter GUI for closeoption_bot.py.
+
+Author: Collins_Obi
+Repo: https://github.com/Collins-Iceball/Binary-Options-Automation
+
+Two panels side by side:
+  - Left:  Normal Trading (strategy, options, martingale)
+  - Right: Quick Trade (session-based, MA-direction, martingale steps)
+
+Picking a radio on one side lights that panel and greys the other.
+
+Writes closeoption_settings.txt, then launches the bot as a subprocess.
+"""
+
+import os
+import signal
+import subprocess
+import sys
+import threading
+from datetime import datetime
+from tkinter import messagebox
+
+import customtkinter as ctk
+
+SETTINGS_PATH = 'closeoption_settings.txt'
+BOT_SCRIPT    = 'closeoption_bot.py'
+
+SETTING_KEYS = [
+    'URL', 'CANDLE_PERIOD', 'BET_AMOUNT', 'MARTINGALE_MULT', 'MAX_MARTINGALE_STEPS',
+    'MIN_PAYOUT', 'EXPIRY_SECONDS', 'VICE_VERSA',
+    'STRATEGY', 'FAST_MA', 'FAST_MA_TYPE', 'SLOW_MA', 'SLOW_MA_TYPE',
+    'VORTEX_PERIOD', 'MARUBOZU_MIN_BODY', 'CCI_PERIOD', 'BB_PERIOD',
+    'RSI_ENABLED', 'RSI_PERIOD', 'RSI_UPPER', 'RSI_CALL_SIGN',
+    'SUPERTREND_ENABLED', 'SUPERTREND_PERIOD',
+    'TAKE_PROFIT_ENABLED', 'TAKE_PROFIT', 'STOP_LOSS_ENABLED', 'STOP_LOSS',
+    'SOCKET_DEBUG',
+    'TRADING_MODE',
+    'QT_FAST_MA', 'QT_SLOW_MA', 'QT_MA_TYPE', 'QT_TRADE_AMOUNT',
+    'QT_MARTINGALE', 'QT_MAX_STEPS', 'QT_SESSIONS',
+    'QT_TAKE_PROFIT_ENABLED', 'QT_TAKE_PROFIT',
+    'QT_MIN_PAYOUT', 'QT_EXPIRY_SECONDS', 'QT_AUTO_CONTINUE',
+]
+
+DEFAULTS = {
+    'URL':                  'https://www.closeoption.com/trade/room/demo',
+    'CANDLE_PERIOD':        10,
+    'BET_AMOUNT':           1,
+    'MARTINGALE_MULT':      3.0,
+    'MAX_MARTINGALE_STEPS': 5,
+    'MIN_PAYOUT':           20,
+    'EXPIRY_SECONDS':       30,
+    'VICE_VERSA':           False,
+    'STRATEGY':             1,
+    'FAST_MA':              3,
+    'FAST_MA_TYPE':         'SMA',
+    'SLOW_MA':              8,
+    'SLOW_MA_TYPE':         'SMA',
+    'VORTEX_PERIOD':        14,
+    'MARUBOZU_MIN_BODY':    95,
+    'CCI_PERIOD':           20,
+    'BB_PERIOD':            20,
+    'RSI_ENABLED':          False,
+    'RSI_PERIOD':           14,
+    'RSI_UPPER':            70,
+    'RSI_CALL_SIGN':        '>',
+    'SUPERTREND_ENABLED':   False,
+    'SUPERTREND_PERIOD':    10,
+    'TAKE_PROFIT_ENABLED':  False,
+    'TAKE_PROFIT':          100,
+    'STOP_LOSS_ENABLED':    False,
+    'STOP_LOSS':            50,
+    'SOCKET_DEBUG':         False,
+    'TRADING_MODE':         'normal',
+    'QT_FAST_MA':           5,
+    'QT_SLOW_MA':           10,
+    'QT_MA_TYPE':           'SMA',
+    'QT_TRADE_AMOUNT':      1,
+    'QT_MARTINGALE':        2.1,
+    'QT_MAX_STEPS':         7,
+    'QT_SESSIONS':          10,
+    'QT_TAKE_PROFIT_ENABLED': False,
+    'QT_TAKE_PROFIT':       100,
+    'QT_MIN_PAYOUT':        20,
+    'QT_EXPIRY_SECONDS':    30,
+    'QT_AUTO_CONTINUE':     False,
+}
+
+EXPIRY_OPTIONS = {
+    '30 seconds': 30,
+    '1 minute':   60,
+    '2 minutes':  120,
+    '5 minutes':  300,
+    '10 minutes': 600,
+    '15 minutes': 900,
+    '30 minutes': 1800,
+    '1 hour':     3600,
+    '4 hours':    14400,
+    '12 hours':   43200,
+    '1 day':      86400,
+    '1 week':     604800,
+    '2 weeks':    1209600,
+    '1 month':    2592000,
+}
+
+STRATEGIES = {
+    'Moving Averages Crossing': 1,
+    'Parabolic SAR':            2,
+    'Vortex':                   3,
+    'Marubozu':                 4,
+    'CCI':                      5,
+    'Bollinger Bands':          6,
+}
+
+
+# ---------------------------------------------------------------
+# Palette
+# ---------------------------------------------------------------
+BG           = '#0f1117'
+PANEL_NORMAL = '#161a24'
+PANEL_QUICK  = '#1a1620'
+FG           = '#e8eaf0'
+FG_DIM       = '#8b90a3'
+FG_FAINT     = '#565c72'
+ACCENT_N     = '#3d7eff'   # normal mode accent (blue)
+ACCENT_Q     = '#f4c95d'   # quick trade accent (yellow)
+BORDER       = '#232838'
+LOG_BG       = '#0a0c14'
+
+ctk.set_appearance_mode('dark')
+ctk.set_default_color_theme('dark-blue')
+
+
+def coerce(value, like):
+    try:
+        if isinstance(like, bool):
+            return str(value).strip().lower() in ('true', '1', 'yes', 'y', 'on')
+        if isinstance(like, int):
+            return int(float(value))
+        if isinstance(like, float):
+            return float(value)
+        return str(value)
+    except Exception:
+        return like
+
+
+def load_settings():
+    values = dict(DEFAULTS)
+    try:
+        with open(SETTINGS_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                k, v = line.split('=', 1)
+                k = k.strip()
+                if k in values:
+                    values[k] = coerce(v, values[k])
+    except FileNotFoundError:
+        pass
+    return values
+
+
+def save_settings(values):
+    with open(SETTINGS_PATH, 'w') as f:
+        f.write('# Auto-generated by closeoption_gui.py\n')
+        for k in SETTING_KEYS:
+            f.write(f'{k}={values[k]}\n')
+
+
+class App:
+    def __init__(self):
+        self.root = ctk.CTk()
+        self.root.title('Binary Options Automation — CloseOption · Collins_Obi')
+        self.root.geometry('1500x780')
+        self.root.minsize(1200, 640)
+        self.root.configure(fg_color=BG)
+
+        self.proc = None
+        self.reader_thread = None
+        self.settings = load_settings()
+        self.vars = {}
+
+        self._build()
+        self.root.protocol('WM_DELETE_WINDOW', self._on_close)
+
+    # ---------- value helpers ----------
+    def _v(self, key):
+        if key not in self.vars:
+            self.vars[key] = ctk.StringVar(value=str(self.settings.get(key, '')))
+        return self.vars[key]
+
+    def _b(self, key):
+        if key not in self.vars:
+            self.vars[key] = ctk.BooleanVar(value=bool(self.settings.get(key, False)))
+        return self.vars[key]
+
+    def _entry(self, parent, key, width=70):
+        return ctk.CTkEntry(parent, textvariable=self._v(key), width=width,
+                            height=28, justify='right', corner_radius=8)
+
+    def _check(self, parent, key, text):
+        return ctk.CTkCheckBox(parent, text=text, variable=self._b(key),
+                               font=('TkDefaultFont', 11),
+                               checkbox_width=18, checkbox_height=18,
+                               corner_radius=4, border_width=2,
+                               fg_color=ACCENT_N, hover_color='#5a91ff')
+
+    def _label(self, parent, text, bold=False):
+        f = ('TkDefaultFont', 12, 'bold') if bold else ('TkDefaultFont', 11)
+        color = FG if bold else FG_DIM
+        return ctk.CTkLabel(parent, text=text, text_color=color, font=f,
+                            anchor='w')
+
+    # ---------- build ----------
+    def _build(self):
+        # header
+        header = ctk.CTkFrame(self.root, fg_color='transparent')
+        header.pack(fill='x', padx=24, pady=(18, 4))
+        ctk.CTkLabel(header, text='CloseOption', text_color=FG,
+                     font=('TkDefaultFont', 22, 'bold')).pack(side='left')
+        ctk.CTkLabel(header, text='  Trading Bot', text_color=ACCENT_N,
+                     font=('TkDefaultFont', 22, 'bold')).pack(side='left')
+        ctk.CTkLabel(header, text='  · Collins_Obi', text_color=FG_DIM,
+                     font=('TkDefaultFont', 11)).pack(side='left', padx=(8, 0), pady=(8, 0))
+
+        # panels row
+        top = ctk.CTkFrame(self.root, fg_color='transparent')
+        top.pack(fill='both', expand=False, padx=18, pady=(10, 6))
+        top.grid_columnconfigure(0, weight=1)
+        top.grid_columnconfigure(1, weight=1)
+
+        self.mode_var = ctk.StringVar(value=self.settings.get('TRADING_MODE', 'normal'))
+
+        self.normal_panel, self.normal_content = self._build_normal_panel(top)
+        self.normal_panel.grid(row=0, column=0, sticky='nsew', padx=(0, 8))
+
+        self.quick_panel, self.quick_content = self._build_quick_panel(top)
+        self.quick_panel.grid(row=0, column=1, sticky='nsew', padx=(8, 0))
+
+        # buttons
+        btns = ctk.CTkFrame(self.root, fg_color='transparent')
+        btns.pack(fill='x', padx=24, pady=(6, 6))
+        self.run_btn = ctk.CTkButton(btns, text='▶   RUN', command=self.run,
+                                     fg_color=ACCENT_N, hover_color='#5a91ff',
+                                     corner_radius=12, width=130, height=40,
+                                     font=('TkDefaultFont', 13, 'bold'))
+        self.run_btn.pack(side='left')
+        self.stop_btn = ctk.CTkButton(btns, text='■   STOP', command=self.stop,
+                                      fg_color='#252a3c', hover_color='#333a52',
+                                      text_color=FG_DIM, corner_radius=12,
+                                      width=130, height=40,
+                                      font=('TkDefaultFont', 13, 'bold'),
+                                      state='disabled')
+        self.stop_btn.pack(side='left', padx=(12, 0))
+
+        # log
+        log_frame = ctk.CTkFrame(self.root, fg_color=LOG_BG, corner_radius=14)
+        log_frame.pack(fill='both', expand=True, padx=24, pady=(0, 20))
+
+        try:
+            log_font = ctk.CTkFont(family='Noto Sans Mono', size=11)
+        except Exception:
+            log_font = ctk.CTkFont(size=11)
+        self.log_box = ctk.CTkTextbox(log_frame, fg_color=LOG_BG,
+                                      text_color=FG, font=log_font,
+                                      corner_radius=14, wrap='word',
+                                      border_width=0,
+                                      scrollbar_button_color='#232838',
+                                      scrollbar_button_hover_color='#333a52')
+        self.log_box.pack(fill='both', expand=True, padx=6, pady=6)
+        self._log = self.log_box._textbox
+        self._log.tag_config('default', foreground=FG)
+        self._log.tag_config('dim',     foreground=FG_DIM)
+        self._log.tag_config('error',   foreground='#ff6b81')
+        self._log.tag_config('win',     foreground='#52dba0')
+        self._log.tag_config('loss',    foreground='#ff6b81')
+        self._log.tag_config('info',    foreground=ACCENT_N)
+        self._log.tag_config('warn',    foreground='#f4c95d')
+
+        self._set_mode_state()
+
+    # ---------- Normal panel ----------
+    def _build_normal_panel(self, parent):
+        panel = ctk.CTkFrame(parent, fg_color=PANEL_NORMAL, corner_radius=16,
+                             border_width=2, border_color=BORDER)
+        panel.grid_rowconfigure(1, weight=1)
+        panel.grid_columnconfigure(0, weight=1)
+
+        head = ctk.CTkFrame(panel, fg_color='transparent')
+        head.grid(row=0, column=0, sticky='ew', padx=18, pady=(14, 6))
+        ctk.CTkRadioButton(head, text='Use Normal Trading',
+                           variable=self.mode_var, value='normal',
+                           command=self._set_mode_state,
+                           font=('TkDefaultFont', 13, 'bold'),
+                           radiobutton_width=18, radiobutton_height=18,
+                           fg_color=ACCENT_N, hover_color='#5a91ff',
+                           text_color=FG, border_width_checked=5,
+                           ).pack(side='left')
+
+        content = ctk.CTkFrame(panel, fg_color='transparent')
+        content.grid(row=1, column=0, sticky='nsew', padx=14, pady=(0, 14))
+
+        # ---- Strategy column ----
+        col_s = ctk.CTkFrame(content, fg_color='transparent')
+        col_s.grid(row=0, column=0, sticky='nw', padx=(0, 20))
+
+        self._label(col_s, 'Strategies', bold=True).grid(row=0, column=0, columnspan=3, sticky='w', pady=(0, 6))
+
+        self.strategy_var = ctk.StringVar(value=self._strategy_name(self.settings['STRATEGY']))
+        r = 1
+        for name in STRATEGIES:
+            ctk.CTkRadioButton(col_s, text=name, variable=self.strategy_var, value=name,
+                               font=('TkDefaultFont', 11),
+                               radiobutton_width=16, radiobutton_height=16,
+                               fg_color=ACCENT_N, hover_color='#5a91ff',
+                               border_width_checked=5
+                               ).grid(row=r, column=0, columnspan=3, sticky='w', pady=1)
+            r += 1
+
+        self._label(col_s, 'Fast MA').grid(row=r, column=0, sticky='w')
+        ctk.CTkOptionMenu(col_s, variable=self._v('FAST_MA_TYPE'),
+                          values=['SMA', 'EMA', 'WMA'],
+                          width=76, height=28, corner_radius=8,
+                          fg_color='#252a3c', button_color='#2f3550',
+                          button_hover_color='#3a4060',
+                          ).grid(row=r, column=1, padx=(6, 6))
+        self._entry(col_s, 'FAST_MA', width=54).grid(row=r, column=2, sticky='e')
+        r += 1
+        self._label(col_s, 'Slow MA').grid(row=r, column=0, sticky='w')
+        ctk.CTkOptionMenu(col_s, variable=self._v('SLOW_MA_TYPE'),
+                          values=['SMA', 'EMA', 'WMA'],
+                          width=76, height=28, corner_radius=8,
+                          fg_color='#252a3c', button_color='#2f3550',
+                          button_hover_color='#3a4060',
+                          ).grid(row=r, column=1, padx=(6, 6))
+        self._entry(col_s, 'SLOW_MA', width=54).grid(row=r, column=2, sticky='e')
+        r += 1
+
+        for label, key in [('Vortex period', 'VORTEX_PERIOD'),
+                           ('Marubozu min body %', 'MARUBOZU_MIN_BODY'),
+                           ('CCI period', 'CCI_PERIOD'),
+                           ('BB period', 'BB_PERIOD')]:
+            self._label(col_s, label).grid(row=r, column=0, sticky='w')
+            self._entry(col_s, key, width=54).grid(row=r, column=2, sticky='e')
+            r += 1
+
+        self._check(col_s, 'RSI_ENABLED', 'RSI').grid(row=r, column=0, sticky='w')
+        self._label(col_s, 'period').grid(row=r, column=1, sticky='e')
+        self._entry(col_s, 'RSI_PERIOD', width=54).grid(row=r, column=2, sticky='e')
+        r += 1
+        self._label(col_s, 'Call if RSI').grid(row=r, column=0, sticky='w')
+        ctk.CTkOptionMenu(col_s, variable=self._v('RSI_CALL_SIGN'),
+                          values=['>', '<'],
+                          width=50, height=28, corner_radius=8,
+                          fg_color='#252a3c', button_color='#2f3550',
+                          button_hover_color='#3a4060',
+                          ).grid(row=r, column=1, padx=(6, 6))
+        self._entry(col_s, 'RSI_UPPER', width=54).grid(row=r, column=2, sticky='e')
+        r += 1
+
+        self._check(col_s, 'SUPERTREND_ENABLED', 'Supertrend').grid(row=r, column=0, sticky='w')
+        self._label(col_s, 'period').grid(row=r, column=1, sticky='e')
+        self._entry(col_s, 'SUPERTREND_PERIOD', width=54).grid(row=r, column=2, sticky='e')
+
+        # ---- Options column ----
+        col_o = ctk.CTkFrame(content, fg_color='transparent')
+        col_o.grid(row=0, column=1, sticky='nw', padx=(0, 20))
+
+        self._label(col_o, 'Options', bold=True).grid(row=0, column=0, columnspan=2, sticky='w', pady=(0, 6))
+        self._label(col_o, 'Min payout %').grid(row=1, column=0, sticky='w')
+        self._entry(col_o, 'MIN_PAYOUT', width=54).grid(row=1, column=1, sticky='e', pady=2)
+
+        self._label(col_o, 'Expiry').grid(row=2, column=0, sticky='w')
+        cur_exp = next((n for n, s in EXPIRY_OPTIONS.items()
+                        if s == int(self.settings['EXPIRY_SECONDS'])), '30 seconds')
+        self.expiry_var = ctk.StringVar(value=cur_exp)
+        ctk.CTkOptionMenu(col_o, variable=self.expiry_var,
+                          values=list(EXPIRY_OPTIONS.keys()),
+                          width=140, height=28, corner_radius=8,
+                          fg_color='#252a3c', button_color='#2f3550',
+                          button_hover_color='#3a4060',
+                          ).grid(row=2, column=1, sticky='e', pady=2)
+
+        self._label(col_o, 'Candle period (sec)').grid(row=3, column=0, sticky='w')
+        self._entry(col_o, 'CANDLE_PERIOD', width=54).grid(row=3, column=1, sticky='e', pady=2)
+
+        self._check(col_o, 'VICE_VERSA', 'Vice versa Call <-> Put').grid(
+            row=4, column=0, columnspan=2, sticky='w', pady=4)
+
+        self._check(col_o, 'TAKE_PROFIT_ENABLED', 'Take profit $').grid(row=5, column=0, sticky='w')
+        self._entry(col_o, 'TAKE_PROFIT', width=72).grid(row=5, column=1, sticky='e', pady=2)
+
+        self._check(col_o, 'STOP_LOSS_ENABLED', 'Stop loss $').grid(row=6, column=0, sticky='w')
+        self._entry(col_o, 'STOP_LOSS', width=72).grid(row=6, column=1, sticky='e', pady=2)
+
+        self._check(col_o, 'SOCKET_DEBUG', 'Log every socket frame').grid(
+            row=7, column=0, columnspan=2, sticky='w', pady=4)
+
+        # ---- Martingale column ----
+        col_m = ctk.CTkFrame(content, fg_color='transparent')
+        col_m.grid(row=0, column=2, sticky='nw')
+
+        self._label(col_m, 'Martingale', bold=True).grid(row=0, column=0, columnspan=2, sticky='w', pady=(0, 6))
+        for label, key in [('Base bet $', 'BET_AMOUNT'),
+                           ('Multiplier x', 'MARTINGALE_MULT'),
+                           ('Max steps', 'MAX_MARTINGALE_STEPS')]:
+            self._label(col_m, label).grid(row=col_m.grid_size()[1], column=0, sticky='w')
+            self._entry(col_m, key, width=72).grid(row=col_m.grid_size()[1] - 1, column=1, sticky='e', pady=2)
+
+        return panel, content
+
+    # ---------- Quick panel ----------
+    def _build_quick_panel(self, parent):
+        panel = ctk.CTkFrame(parent, fg_color=PANEL_QUICK, corner_radius=16,
+                             border_width=2, border_color=BORDER)
+        panel.grid_rowconfigure(1, weight=1)
+        panel.grid_columnconfigure(0, weight=1)
+
+        head = ctk.CTkFrame(panel, fg_color='transparent')
+        head.grid(row=0, column=0, sticky='ew', padx=18, pady=(14, 6))
+        ctk.CTkRadioButton(head, text='Use Quick Trade',
+                           variable=self.mode_var, value='quick',
+                           command=self._set_mode_state,
+                           font=('TkDefaultFont', 13, 'bold'),
+                           radiobutton_width=18, radiobutton_height=18,
+                           fg_color=ACCENT_Q, hover_color='#e6b94d',
+                           text_color=FG, border_width_checked=5,
+                           ).pack(side='left')
+
+        content = ctk.CTkFrame(panel, fg_color='transparent')
+        content.grid(row=1, column=0, sticky='nsew', padx=18, pady=(0, 14))
+
+        self._label(content, 'Session-based: MA-position direction, martingale per session.',
+                    ).grid(row=0, column=0, columnspan=3, sticky='w', pady=(0, 10))
+
+        r = 1
+        self._label(content, 'Fast MA').grid(row=r, column=0, sticky='w')
+        ctk.CTkOptionMenu(content, variable=self._v('QT_MA_TYPE'),
+                          values=['SMA', 'EMA', 'WMA'],
+                          width=76, height=28, corner_radius=8,
+                          fg_color='#252a3c', button_color='#2f3550',
+                          button_hover_color='#3a4060',
+                          ).grid(row=r, column=1, padx=(6, 6))
+        self._entry(content, 'QT_FAST_MA', width=72).grid(row=r, column=2, sticky='e')
+        r += 1
+
+        self._label(content, 'Slow MA').grid(row=r, column=0, sticky='w')
+        self._entry(content, 'QT_SLOW_MA', width=72).grid(row=r, column=2, sticky='e', pady=2); r += 1
+        self._label(content, 'Amount $').grid(row=r, column=0, sticky='w')
+        self._entry(content, 'QT_TRADE_AMOUNT', width=72).grid(row=r, column=2, sticky='e', pady=2); r += 1
+        self._label(content, 'Martingale x').grid(row=r, column=0, sticky='w')
+        self._entry(content, 'QT_MARTINGALE', width=72).grid(row=r, column=2, sticky='e', pady=2); r += 1
+        self._label(content, 'Max Steps').grid(row=r, column=0, sticky='w')
+        self._entry(content, 'QT_MAX_STEPS', width=72).grid(row=r, column=2, sticky='e', pady=2); r += 1
+        self._label(content, 'Sessions (min 10)').grid(row=r, column=0, sticky='w')
+        self._entry(content, 'QT_SESSIONS', width=72).grid(row=r, column=2, sticky='e', pady=2); r += 1
+
+        self._label(content, 'Expiry').grid(row=r, column=0, sticky='w')
+        cur_qt_exp = next((n for n, s in EXPIRY_OPTIONS.items()
+                           if s == int(self.settings.get('QT_EXPIRY_SECONDS', 30))),
+                          '30 seconds')
+        self.qt_expiry_var = ctk.StringVar(value=cur_qt_exp)
+        ctk.CTkOptionMenu(content, variable=self.qt_expiry_var,
+                          values=list(EXPIRY_OPTIONS.keys()),
+                          width=140, height=28, corner_radius=8,
+                          fg_color='#252a3c', button_color='#2f3550',
+                          button_hover_color='#3a4060',
+                          ).grid(row=r, column=1, columnspan=2, sticky='e', pady=2); r += 1
+
+        self._check(content, 'QT_TAKE_PROFIT_ENABLED', 'Take profit $').grid(
+            row=r, column=0, columnspan=2, sticky='w', pady=4)
+        self._entry(content, 'QT_TAKE_PROFIT', width=72).grid(row=r, column=2, sticky='e'); r += 1
+        self._label(content, 'Min Payout %').grid(row=r, column=0, sticky='w')
+        self._entry(content, 'QT_MIN_PAYOUT', width=72).grid(row=r, column=2, sticky='e', pady=2); r += 1
+
+        self._check(content, 'QT_AUTO_CONTINUE', 'Auto-continue (5 sessions per run)').grid(
+            row=r, column=0, columnspan=3, sticky='w', pady=4)
+
+        return panel, content
+
+    @staticmethod
+    def _strategy_name(num):
+        for name, val in STRATEGIES.items():
+            if val == num:
+                return name
+        return 'Moving Averages Crossing'
+
+    # ---------- mode toggling ----------
+    def _set_group_state(self, frame, enabled):
+        state = 'normal' if enabled else 'disabled'
+        def walk(w):
+            try:
+                w.configure(state=state)
+            except Exception:
+                pass
+            try:
+                for child in w.winfo_children():
+                    walk(child)
+            except Exception:
+                pass
+        walk(frame)
+
+    def _set_mode_state(self):
+        quick = self.mode_var.get() == 'quick'
+        try:
+            self.normal_panel.configure(border_color=ACCENT_N if not quick else BORDER)
+            self.quick_panel.configure(border_color=ACCENT_Q if quick else BORDER)
+        except Exception:
+            pass
+        self._set_group_state(self.normal_content, not quick)
+        self._set_group_state(self.quick_content, quick)
+
+    # ---------- log ----------
+    def log(self, text, tag='default'):
+        self._log.insert('end', text, tag)
+        self._log.see('end')
+
+    # ---------- settings collection ----------
+    def collect_settings(self):
+        s = dict(self.settings)
+        for k in ['CANDLE_PERIOD', 'BET_AMOUNT', 'MAX_MARTINGALE_STEPS', 'MIN_PAYOUT',
+                  'FAST_MA', 'SLOW_MA', 'VORTEX_PERIOD', 'MARUBOZU_MIN_BODY',
+                  'CCI_PERIOD', 'BB_PERIOD', 'RSI_PERIOD', 'RSI_UPPER',
+                  'SUPERTREND_PERIOD', 'TAKE_PROFIT', 'STOP_LOSS',
+                  'QT_FAST_MA', 'QT_SLOW_MA', 'QT_TRADE_AMOUNT',
+                  'QT_MAX_STEPS', 'QT_SESSIONS', 'QT_TAKE_PROFIT',
+                  'QT_MIN_PAYOUT']:
+            s[k] = int(float(self._v(k).get()))
+        s['MARTINGALE_MULT'] = float(self._v('MARTINGALE_MULT').get())
+        s['QT_MARTINGALE']  = float(self._v('QT_MARTINGALE').get())
+        for k in ['FAST_MA_TYPE', 'SLOW_MA_TYPE', 'RSI_CALL_SIGN', 'URL', 'QT_MA_TYPE']:
+            s[k] = self._v(k).get()
+        for k in ['VICE_VERSA', 'RSI_ENABLED', 'SUPERTREND_ENABLED',
+                  'TAKE_PROFIT_ENABLED', 'STOP_LOSS_ENABLED', 'SOCKET_DEBUG',
+                  'QT_TAKE_PROFIT_ENABLED', 'QT_AUTO_CONTINUE']:
+            s[k] = bool(self._b(k).get())
+        s['STRATEGY'] = STRATEGIES.get(self.strategy_var.get(), 1)
+        s['EXPIRY_SECONDS'] = EXPIRY_OPTIONS[self.expiry_var.get()]
+        s['QT_EXPIRY_SECONDS'] = EXPIRY_OPTIONS[self.qt_expiry_var.get()]
+        s['TRADING_MODE'] = self.mode_var.get()
+
+        if s['FAST_MA'] >= s['SLOW_MA']:
+            raise ValueError('Fast MA must be less than Slow MA')
+        if s['BET_AMOUNT'] < 1:
+            raise ValueError('Base bet must be >= 1')
+        if s['MARTINGALE_MULT'] <= 1:
+            raise ValueError('Martingale multiplier must be > 1')
+        if s['MAX_MARTINGALE_STEPS'] < 1:
+            raise ValueError('Max martingale steps must be >= 1')
+        if s['CANDLE_PERIOD'] < 1:
+            raise ValueError('Candle period must be >= 1 second')
+        if s['TRADING_MODE'] == 'quick':
+            if s['QT_FAST_MA'] >= s['QT_SLOW_MA']:
+                raise ValueError('QT: Fast MA must be less than Slow MA')
+            if s['QT_TRADE_AMOUNT'] < 1:
+                raise ValueError('QT amount must be >= 1')
+            if s['QT_MARTINGALE'] <= 1:
+                raise ValueError('QT martingale multiplier must be > 1')
+            if s['QT_MAX_STEPS'] < 1:
+                raise ValueError('QT max steps must be >= 1')
+            if s['QT_SESSIONS'] < 10:
+                raise ValueError('QT sessions minimum is 10')
+            if s['QT_TAKE_PROFIT_ENABLED'] and s['QT_TAKE_PROFIT'] < 1:
+                raise ValueError('QT take profit must be >= 1')
+            if s['QT_MIN_PAYOUT'] < 0 or s['QT_MIN_PAYOUT'] > 100:
+                raise ValueError('QT min payout must be 0-100')
+        return s
+
+    # ---------- run / stop ----------
+    def run(self):
+        try:
+            s = self.collect_settings()
+        except Exception as e:
+            messagebox.showerror('Invalid settings', str(e))
+            return
+
+        save_settings(s)
+        self.settings = s
+        self.log_box.delete('1.0', 'end')
+        self.log(f'{datetime.now().strftime("%H:%M:%S")}  starting bot ({s["TRADING_MODE"]} mode)\n', 'info')
+
+        try:
+            self.proc = subprocess.Popen(
+                [sys.executable, '-u', BOT_SCRIPT, '--no-prompt'],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+                preexec_fn=os.setsid if os.name != 'nt' else None,
+            )
+        except Exception as e:
+            messagebox.showerror('Launch failed', str(e))
+            self.proc = None
+            return
+
+        self.run_btn.configure(state='disabled', fg_color='#232838', text_color=FG_FAINT)
+        self.stop_btn.configure(state='normal', text_color=FG)
+
+        self.reader_thread = threading.Thread(target=self._reader, daemon=True)
+        self.reader_thread.start()
+
+        # Forward whatever the launcher sends us to the child bot's stdin, so
+        # Y/N/A answers reach the bot instead of piling up in our own buffer.
+        if not sys.stdin.isatty():
+            self.stdin_thread = threading.Thread(target=self._stdin_forwarder,
+                                                 daemon=True)
+            self.stdin_thread.start()
+
+    def _stdin_forwarder(self):
+        """Read from our own stdin (typically piped by startup.py) and pass
+        each line straight through to the bot's stdin."""
+        while True:
+            try:
+                line = sys.stdin.readline()
+            except Exception:
+                return
+            if line == '':
+                return  # EOF
+            if not self.proc or not self.proc.stdin:
+                continue
+            try:
+                self.proc.stdin.write(line)
+                self.proc.stdin.flush()
+            except Exception:
+                return
+
+    def _reader(self):
+        try:
+            for line in self.proc.stdout:
+                # Tee the bot's stdout to our own stdout, so a parent process
+                # (like startup.py's dashboard) can parse the same trade lines
+                # we're showing in our own log widget.
+                try:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+                self.root.after(0, self.log, line, self._classify(line))
+        except Exception:
+            pass
+        self.root.after(0, self._on_exit)
+
+    @staticmethod
+    def _classify(line):
+        low = line.lower()
+        if 'error' in low or 'traceback' in low or 'fatal' in low:
+            return 'error'
+        if 'win' in low and 'result' in low:
+            return 'win'
+        if 'loss' in low and 'result' in low:
+            return 'loss'
+        if 'insufficient' in low or 'warning' in low or 'timed out' in low:
+            return 'warn'
+        if 'launching' in low or 'ready' in low or 'mode:' in low:
+            return 'info'
+        return 'default'
+
+    def _on_exit(self):
+        self.run_btn.configure(state='normal', fg_color=ACCENT_N, text_color='white')
+        self.stop_btn.configure(state='disabled', text_color=FG_DIM)
+        self.log(f'\n{datetime.now().strftime("%H:%M:%S")}  bot exited\n', 'dim')
+        self.proc = None
+
+    def stop(self):
+        if not self.proc:
+            return
+        proc = self.proc
+        self.proc = None
+        try:
+            if os.name != 'nt':
+                try:
+                    pgid = os.getpgid(proc.pid)
+                except ProcessLookupError:
+                    self.log('(process already gone)\n', 'dim')
+                    return
+                os.killpg(pgid, signal.SIGINT)
+
+                def force_kill():
+                    if proc.poll() is None:
+                        try:
+                            os.killpg(pgid, signal.SIGKILL)
+                            self.log('(force-killed after 3s)\n', 'warn')
+                        except Exception:
+                            pass
+                self.root.after(3000, force_kill)
+            else:
+                proc.send_signal(signal.CTRL_BREAK_EVENT)
+        except Exception as e:
+            self.log(f'(stop failed: {e})\n', 'error')
+
+    def _on_close(self):
+        if self.proc:
+            try:
+                if os.name != 'nt':
+                    os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+                else:
+                    self.proc.kill()
+            except Exception:
+                pass
+        self.root.destroy()
+
+
+def main():
+    app = App()
+    app.root.mainloop()
+
+
+if __name__ == '__main__':
+    main()

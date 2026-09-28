@@ -48,7 +48,7 @@ driver = get_driver()
 
 
 def load_web_driver():
-    url = 'https://u.shortink.io/cabinet/demo-quick-high-low?utm_campaign=806509&utm_source=affiliate&utm_medium=sr&a=ovlztqbPkiBiOt&ac=github'
+    url = 'https://pocketoption.com/en/cabinet/demo-quick-high-low/'
     driver.get(url)
 
 

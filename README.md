@@ -1,69 +1,114 @@
-# [Pocket Option Trading Bot](https://pocket2.click/register?utm_campaign=806509&utm_source=affiliate&utm_medium=sr&a=ovlztqbPkiBiOt&ac=github)
+# Binary Options Automation
 
-[Download Bot v2 for Windows](https://drive.google.com/file/d/1NnOpoKeE08Q-oMSzpQ-VZ2h4i7ZtHAVB) password: Password
+**Author:** Collins_Obi  
+**Repository:** [Collins-Iceball/Binary-Options-Automation](https://github.com/Collins-Iceball/Binary-Options-Automation)
 
-[Download Bot v1 for Windows](https://drive.google.com/file/d/1RiNGyNvrSooTqOWVv6vj9GKtWupOtfMs) password: Password
+Automated binary-options trading stack for **Pocket Option** and **CloseOption**, with a CustomTkinter launcher dashboard, strategy config GUIs, Quick Trade mode, martingale controls, take-profit / stop-loss, and historical backtesting.
 
-### What's new in v2
-- allowed multiple assets
-- all timeframes allowed
-- added visual interface to setup your trading strategy
-- it works faster now (async), no screen reloading required
-- it's possible to set minimal payout
-- you may set take profit and stop loss
-- you may invert Call and Put with Vice Versa feature
-- improved Martingale, you can set a list of amounts yourself
-- backtest! You may backtest your strategy and see the approximate profit and frequency on historical data
+This project started from a public Pocket Option bot base and has been **heavily rewritten and extended** by Collins_Obi (GUI launcher, CloseOption adapter, Quick Trade, balance settlement, session handling, and operational tooling).
 
-### Run other bots
-`python3 po_bot_indicators.py`
-to run trading bot with strategy based indicators (only Mac and Linux users)
+---
 
-`python3 po_bot_ml.py`
-to run trading bot with Machine Learning for prediction (only Mac and Linux users)
+## Features
 
-### Other scripts
-`python3 test_on_historical_data.py`
-to test your strategies on historical data (only Mac and Linux users)
+- Unified launcher dashboard (`startup.py`) — pick platform, launch, live balance / P/L / sessions / equity curve
+- Pocket Option bot (`pocketoption_bot.py`) — Normal + Quick Trade modes, strategy GUI, TP/SL, martingale
+- CloseOption bot (`closeoption_gui.py` + `closeoption_bot.py`) — separate broker adapter and settings
+- Strategies: moving-average cross, PSAR, Vortex, Marubozu, CCI, Bollinger Bands, optional RSI / Supertrend filters
+- Quick Trade: MA direction lock per session, configurable expiry, sessions target, auto-continue
+- Backtest helpers (`test_on_historical_data.py`) using `data_1m` / `data_5m`
+- Legacy / experimental scripts: `po_bot.py`, `po_bot_indicators.py`, `po_bot_ml.py`
 
-### Information
-Bot connects to websocket and receives signals every half a second from PO.
-To make it more convenient, I simplify data to 1 second so that to use seconds
-everywhere. After each change of currency, the screen reloads. It is to cut
-unwanted signals from previous currencies.
+---
 
-### Pocket Option trading bot Martingale
-`po_bot.py` - Martingale trading. The default strategy is pretty simple. If the previous candles are red, the bot makes 'put' order. And 'call' otherwise. You can see a current Martingale stack in the console (Martingale stack). For example, Martingale stack [1, 3, 7, 15, 31, 62, 124, 249, 499, 999] means that if you order $1 and lose, the next order will be $3, then $7, and so on. You can change `MARTINGALE_COEFFICIENT`.
-!Important. Your timeframe always must be >= estimation. For example, if your timeframe is 10s, your estimation can't be 11s and higher.
+## Requirements
 
-### Pocket Option trading bot v2
-`po_bot_v2.py` - the last version of the trading bot with all features.
+- Linux (primary), macOS also workable; Windows not the main target for this fork
+- Python 3.10+ (project venv currently uses your local Python)
+- Google Chrome
+- [.NET 6+](https://dotnet.microsoft.com/en-us/download/dotnet/6.0) — required by `stock-indicators`
 
-### Pocket Option trading bot with indicators
-`po_bot_indicators.py` - script allows you to try different indicators and their combinations. See how an example in `check_indicators()` works and make your updates. Currently, the PSAR strategy is used. Despite using default parameters `acceleration_step=0.02`, `max_acceleration_factor=0.2`, bot's sensitivity is higher, so additional orders appear. Works for 1m and higher timeframes. 
-Only for Mac, Linux, .NET6.0 or newer required: https://dotnet.microsoft.com/en-us/download/dotnet/6.0
+---
 
-### Pocket Option trading bot with machine learning
-`po_bot_ml.py` - script makes orders based on prediction. Random Forest Classifier approach is used. The prediction is based on the indicators: `awesome_oscillator`, `PSAR`, `CCI` and `MACD` from the last 100 candles. Bot makes an order when the probability is > 0.60. You can set even higher values (0.70, 0.80, 0.90) in the `check_data()` method. !important! You have to set estimation = TIME param. For example, if your `po_bot_ml.py/TIME`=5, then set your estimation to 5 candles. Another example, your timeframe is 30m, and your estimation is 1h, so set TIME=2. The bot makes a prediction only for PUT action. And if probability < 30%, then CALL action fires. Works for 1m and higher timeframes. 
-Only for Mac, Linux, .NET6.0 or newer required: https://dotnet.microsoft.com/en-us/download/dotnet/6.0
+## Setup
 
-### Backtest
-`test_on_historical_data.py` - here you can backtest strategies on historical data of 1m and 5m timeframes. To create your own history files, set `SAVE_CSV` to `True` in `po_bot_indicators.py`. Or you can use any non-OTC assets available in yfinance to get history data.
-Also, backtest is a feature in v2.
+```bash
+cd "/path/to/Binary-Options-Automation"   # or pocket_option_trading_bot
 
-### FAQ
-`Is it free?`
-Version 1 is fully free, and you can use it without any payments. Version 2 is paid with 10 free trades every day as a trial.
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 
-`Is it profitable?`
-Sometimes.
+# .NET runtime for stock-indicators
+export DOTNET_ROOT=$HOME/.dotnet
+export PATH=$PATH:$DOTNET_ROOT:$DOTNET_ROOT/tools
+```
 
-### Links
-[Pocket Option registration link](https://pocket2.click/register?utm_campaign=806509&utm_source=affiliate&utm_medium=sr&a=ovlztqbPkiBiOt&ac=github)
+See `run.md` for Chrome profile lock cleanup and troubleshooting notes.
 
-[Telegram](https://t.me/pocketoption_trading_bot)
+---
 
-[YouTube](https://www.youtube.com/channel/UCfVo7aRwQ0M0EV6LeC7R5Gw)
+## Run
 
-### Donations
-If you want to thank the author for his work, [buy me a coffee](https://buymeacoffee.com/vitaliisviatiuk).
+**Recommended (launcher + dashboard):**
+
+```bash
+source .venv/bin/activate
+python3 -u startup.py
+```
+
+From the launcher you can start:
+
+| Platform       | What runs              |
+|----------------|------------------------|
+| Pocket Option  | `pocketoption_bot.py`  |
+| CloseOption    | `closeoption_gui.py`   |
+
+**Direct (without launcher):**
+
+```bash
+python3 -u pocketoption_bot.py
+python3 -u closeoption_gui.py
+```
+
+**Other scripts:**
+
+```bash
+python3 po_bot_indicators.py          # indicator experiments
+python3 po_bot_ml.py                  # ML experiment (needs scikit-learn)
+python3 test_on_historical_data.py    # offline backtest
+```
+
+---
+
+## Settings
+
+- Pocket Option: `settings.txt` (written by the bot GUI)
+- CloseOption: `closeoption_settings.txt` (written by `closeoption_gui.py`)
+
+---
+
+## Project layout (main)
+
+```
+startup.py              # Launcher + live dashboard
+pocketoption_bot.py     # Pocket Option bot + config GUI
+closeoption_gui.py      # CloseOption config GUI
+closeoption_bot.py      # CloseOption trading engine
+driver.py / utils.py    # Shared helpers (legacy scripts)
+requirements.txt
+run.md                  # Ops / Chrome / venv notes
+data_1m/ data_5m/       # Sample historical candles
+```
+
+---
+
+## Disclaimer
+
+Trading involves risk of loss. This software is for education and automation research. Use demo accounts first. Automating third-party broker sites may violate their terms of service — you are responsible for how you use it.
+
+---
+
+## License / credit
+
+Maintained by **Collins_Obi** · [github.com/Collins-Iceball/Binary-Options-Automation](https://github.com/Collins-Iceball/Binary-Options-Automation)
