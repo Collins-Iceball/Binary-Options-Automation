@@ -12,6 +12,15 @@ from stock_indicators import indicators
 from driver import get_driver
 from utils import get_quotes, get_value
 
+# ---- Colourful output (display only - never used in any comparison) ----
+EMO_BUY    = '🟩💹'
+EMO_SELL   = '🟥🔻'
+EMO_CLOCK  = '⏰'
+EMO_MODEL  = '🤖'
+EMO_WAIT   = '⏳'
+EMO_PUT    = '🔻'
+EMO_CALL   = '🔺'
+
 BASE_URL = 'https://pocketoption.com'  # change if PO is blocked in your country
 _DEBUG_STATS = {'loops': 0, 'log_entries': 0, 'opcode2': 0, 'decoded': 0, 'candle_updates': 0, 'last_report': 0}
 PERIOD = 0  # PERIOD on the graph in seconds, one of: 5, 10, 15, 30, 60, 300 etc.
@@ -59,13 +68,15 @@ def do_action(signal):
 
     if action:
         try:
+            dir_emo = EMO_BUY if signal == 'call' else EMO_SELL
             print(
-                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {signal.upper()}, currency: {CURRENCY} last_value: {last_value}")
+                f"{EMO_CLOCK} {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
+                f"{dir_emo} {signal.upper()} on {CURRENCY} | price {last_value}")
             driver.find_element(by=By.CLASS_NAME, value=f'btn-{signal}').click()
             ACTIONS[datetime.now()] = last_value
             IS_AMOUNT_SET = False
         except Exception as e:
-            print(e)
+            print(f'❌ {e}')
 
 
 def get_data(quotes, only_last_row=False):
@@ -118,9 +129,10 @@ def check_data():
     model_accuracy = accuracy_score(y_test, y_pred)
     last = pd.DataFrame(get_data(quotes, only_last_row=True), columns=HEADER[:-1])
     probe = model.predict_proba(last)
-    print('Model accuracy:', round(model_accuracy, 2),
-          'PUT probability:', round(probe[0][0], 2),
-          'CALL probability:', round(probe[0][1], 2))
+    acc_emoji = '🟢' if model_accuracy > 0.55 else ('🟡' if model_accuracy > 0.45 else '🔴')
+    print(f'{EMO_MODEL} Accuracy: {acc_emoji} {round(model_accuracy, 2)}  |  '
+          f'{EMO_PUT} PUT: {round(probe[0][0], 2)}  |  '
+          f'{EMO_CALL} CALL: {round(probe[0][1], 2)}')
 
     # if model_accuracy > 0.50:
     if probe[0][0] > 0.60:
@@ -128,7 +140,7 @@ def check_data():
     elif probe[0][1] > 0.60:
         do_action('call')
     else:
-        print(quotes[-1].date, 'working...')
+        print(f'{EMO_WAIT} {quotes[-1].date} — no signal, waiting...')
 
 
 def _debug_report():
@@ -138,7 +150,7 @@ def _debug_report():
     if now - _DEBUG_STATS['last_report'] < 10:
         return
     _DEBUG_STATS['last_report'] = now
-    print(f"[status] loops={_DEBUG_STATS['loops']}  "
+    print(f"{EMO_CLOCK} [status] loops={_DEBUG_STATS['loops']}  "
           f"log_entries={_DEBUG_STATS['log_entries']}  "
           f"opcode2={_DEBUG_STATS['opcode2']}  "
           f"decoded={_DEBUG_STATS['decoded']}  "
@@ -198,7 +210,7 @@ def websocket_log():
                     if tstamp % PERIOD == 0:
                         if tstamp not in [c[0] for c in CANDLES]:
                             CANDLES.append([tstamp, value, value, value, value])
-                print('Got', len(CANDLES), 'candles for', data['asset'])
+                print(f'📊 Got {len(CANDLES)} candles for {data["asset"]}')
             try:
                 current_value = data[0][2]
                 CANDLES[-1][2] = current_value  # set close all the time
@@ -221,7 +233,7 @@ def websocket_log():
 if __name__ == '__main__':
     load_web_driver()
     import time as _t
-    print('[status] waiting for data... (log in to PO and open the demo trade room)')
+    print(f'{EMO_WAIT} waiting for data... (log in to PO and open the demo trade room)')
     while True:
         websocket_log()
         _t.sleep(0.25)  # was a tight loop, hammering CPU and the perf-log API
