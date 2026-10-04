@@ -8,7 +8,7 @@ echo 'export PATH=$PATH:$DOTNET_ROOT:$DOTNET_ROOT/tools' >> ~/.bashrc
 source ~/.bashrc
 
 # --- Recommended daily launch ---
-cd "/home/collins/Me/Software/Trading Bot GUI/pocket_option_trading_bot"
+cd "/home/collins/Me/Software/Trading Bot GUI/Binary_Option_trading_bot"
 source .venv/bin/activate
 export DOTNET_ROOT=$HOME/.dotnet
 export PATH=$PATH:$DOTNET_ROOT:$DOTNET_ROOT/tools
@@ -31,7 +31,7 @@ rm -f "$HOME/.config/google-chrome/Trading Bot Profile/SingletonSocket"
 rm -f "$HOME/.config/google-chrome/Trading Bot Profile/SingletonCookie"
 
 # 3. Go to the bot folder
-cd "/home/collins/Me/Software/Trading Bot GUI/pocket_option_trading_bot"
+cd "/home/collins/Me/Software/Trading Bot GUI/Binary_Option_trading_bot"
 
 # 4. Activate the virtual environment
 source .venv/bin/activate
@@ -74,7 +74,7 @@ python3 -u startup.py
 # Fix for a change of Location
 
 # 1. Go to the NEW folder (quotes are mandatory because of the space)
-cd "/home/collins/Me/Software/Trading Bot GUI/pocket_option_trading_bot"
+cd "/home/collins/Me/Software/Trading Bot GUI/Binary_Option_trading_bot"
 
 # 2. Kill any zombie Chrome/chromedriver processes
 pkill -9 -f "Trading Bot Profile"
