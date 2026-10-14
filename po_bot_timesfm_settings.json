@@ -1,0 +1,6 @@
+{
+  "use_custom_base_bet": true,
+  "base_bet": 7.0,
+  "martingale_mult": 2.2,
+  "max_steps": 20
+}

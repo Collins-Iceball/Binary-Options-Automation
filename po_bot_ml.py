@@ -1,227 +1,157 @@
-import base64
-import json
-from datetime import datetime, timedelta
+#!/usr/bin/env python3
+"""
+patch_ml1_fixes.py - small exact-text patches for po_bot_ml_1.py
 
-import pandas as pd
-from selenium.webdriver.common.by import By
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score
-from sklearn.model_selection import train_test_split
-from stock_indicators import indicators
+Usage:
+    python3 patch_ml1_fixes.py [path/to/po_bot_ml_1.py] [--skip=direction]
 
-from driver import get_driver
-from utils import get_quotes, get_value
+One concern per patch. Every hunk must match exactly once (or already be
+applied). If ANY hunk fails, nothing is written. A .bak copy is made before the
+file is touched.
+"""
+import shutil
+import sys
 
-BASE_URL = 'https://pocketoption.com'  # change if PO is blocked in your country
-_DEBUG_STATS = {'loops': 0, 'log_entries': 0, 'opcode2': 0, 'decoded': 0, 'candle_updates': 0, 'last_report': 0}
-PERIOD = 0  # PERIOD on the graph in seconds, one of: 5, 10, 15, 30, 60, 300 etc.
-TIME = 1  # minutes
-CANDLES = []
-ACTIONS = {}  # dict of {datetime: value} when an action has been made
-MAX_ACTIONS = 1  # how many actions allowed at the period of time
-ACTIONS_SECONDS = PERIOD  # how long action still in ACTIONS
-LAST_REFRESH = datetime.now()
-CURRENCY = None
-CURRENCY_CHANGE = False
-CURRENCY_CHANGE_DATE = datetime.now()
-HEADER = [
-    # 'supertrend',
-    'emalong',
-    # 'emashort',
-    'awesome_oscillator',
-    'psar',
-    'cci',
-    'macd',
-    'profit',
+args = [a for a in sys.argv[1:] if not a.startswith('--')]
+SKIP = {a.split('=', 1)[1] for a in sys.argv[1:] if a.startswith('--skip=')}
+PATH = args[0] if args else 'po_bot_ml_1.py'
+
+
+def L(*lines):
+    return '\n'.join(lines)
+
+
+PATCHES = [
+    (
+        'ema_feature',
+        'The first feature (EMA cross) was always computed from the LAST candles, '
+        'so every training row got the same value - a dead column. It now uses the '
+        'row index i (i = -1 for the live row, so live behaviour is unchanged).',
+        [
+            (
+                "emashort[-2].ema > emalong[-2].ema and emashort[-1].ema < emalong[-1].ema and get_value(",
+                "emashort[i - 1].ema > emalong[i - 1].ema and emashort[i].ema < emalong[i].ema and get_value(",
+            ),
+            (
+                "quotes[-1]) < get_value(quotes[-2]) < get_value(quotes[-3]) else 0)",
+                "quotes[i]) < get_value(quotes[i - 1]) < get_value(quotes[i - 2]) else 0)",
+            ),
+        ],
+    ),
+    (
+        'time_split',
+        'train_test_split was shuffling candle rows, so the test set sat inside the '
+        'training period (leakage). Now the test set is the most recent 20%.',
+        [
+            (
+                "train_test_split(X, y, test_size=0.2, random_state=42)",
+                "train_test_split(X, y, test_size=0.2, shuffle=False)",
+            ),
+        ],
+    ),
+    (
+        'show_n',
+        'The Accuracy line now prints the test-set size (n=...) so you can see how '
+        'little ~30 rows can tell you.',
+        [
+            (
+                "Accuracy: {acc_emoji} {round(model_accuracy, 2)}  |  '",
+                "Accuracy: {acc_emoji} {round(model_accuracy, 2)} (n={len(y_test)})  |  '",
+            ),
+        ],
+    ),
+    (
+        'direction',
+        'The label is 1 when the NEXT close is lower-or-equal, so predict_proba column 1 '
+        'is P(down) and column 0 is P(up). The code had them swapped (CALL on P(down)). '
+        'Fixed the print and the trigger. Assumes utils.get_value returns the close - '
+        'skip with --skip=direction if it does not.',
+        [
+            (
+                "{EMO_PUT} PUT: {round(probe[0][0], 2)}",
+                "{EMO_PUT} PUT: {round(probe[0][1], 2)}",
+            ),
+            (
+                "{EMO_CALL} CALL: {round(probe[0][1], 2)}",
+                "{EMO_CALL} CALL: {round(probe[0][0], 2)}",
+            ),
+            (
+                L("    if probe[0][0] > 0.60:",
+                  "        do_action('put')",
+                  "    elif probe[0][1] > 0.60:",
+                  "        do_action('call')"),
+                L("    if probe[0][1] > 0.60:",
+                  "        do_action('put')",
+                  "    elif probe[0][0] > 0.60:",
+                  "        do_action('call')"),
+            ),
+        ],
+    ),
 ]
 
-driver = get_driver()
 
+def main():
+    with open(PATH, 'r', newline='') as f:
+        src = f.read()
+    crlf = '\r\n' in src
 
-def load_web_driver():
-    url = f'{BASE_URL}/en/cabinet/demo-quick-high-low/'
-    driver.get(url)
+    def nl(s):
+        return s.replace('\n', '\r\n') if crlf else s
 
+    text = src
+    results = []
+    failed = False
 
-def do_action(signal):
-    action = True
-    last_value = CANDLES[-1][2]
+    for name, why, hunks in PATCHES:
+        if name in SKIP:
+            results.append((name, 'skipped', why))
+            continue
+        states = []
+        for old, new in hunks:
+            old, new = nl(old), nl(new)
+            n = text.count(old)
+            if n == 1:
+                text = text.replace(old, new, 1)
+                states.append('applied')
+            elif n == 0 and new in text:
+                states.append('already')
+            else:
+                states.append(f'FAILED (old text matched {n}x)')
+                failed = True
+        if any(s.startswith('FAILED') for s in states):
+            status = 'FAILED'
+        elif all(s == 'already' for s in states):
+            status = 'already applied'
+        else:
+            status = 'applied'
+        results.append((name, status, why, states))
 
-    global ACTIONS, IS_AMOUNT_SET
-    for dat in list(ACTIONS.keys()):
-        if dat < datetime.now() - timedelta(seconds=ACTIONS_SECONDS):
-            del ACTIONS[dat]
+    print(f'target: {PATH}')
+    for r in results:
+        print(f'  [{r[1]}] {r[0]}')
+        if r[1] == 'FAILED':
+            for s in r[3]:
+                print(f'      hunk: {s}')
 
-    if action:
-        if len(ACTIONS) >= MAX_ACTIONS:
-            # print(f"Max actions reached, don't do a {signal} action")
-            action = False
+    if failed:
+        print('\nA hunk did not match - NOTHING was written. '
+              'Paste me the section around that code and I will re-anchor it.')
+        sys.exit(1)
 
-    if action:
-        try:
-            print(
-                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {signal.upper()}, currency: {CURRENCY} last_value: {last_value}")
-            driver.find_element(by=By.CLASS_NAME, value=f'btn-{signal}').click()
-            ACTIONS[datetime.now()] = last_value
-            IS_AMOUNT_SET = False
-        except Exception as e:
-            print(e)
-
-
-def get_data(quotes, only_last_row=False):
-    supertrend = indicators.get_super_trend(quotes)
-    emalong = indicators.get_ema(quotes, lookback_periods=8)
-    emashort = indicators.get_ema(quotes, lookback_periods=3)
-    awesome_oscillator = indicators.get_awesome(quotes)
-    psar = indicators.get_parabolic_sar(quotes)
-    cci = indicators.get_cci(quotes)
-    macd = indicators.get_macd(quotes)
-
-    data = []
-    for i in range(40, len(quotes), 1):
-        try:
-            row = []
-            if only_last_row:
-                i = -1
-                # row.append(1 if supertrend[i].upper_band else 0)  # not working on Windows non-en_US locale
-            row.append(1 if emashort[-2].ema > emalong[-2].ema and emashort[-1].ema < emalong[-1].ema and get_value(
-                quotes[-1]) < get_value(quotes[-2]) < get_value(quotes[-3]) else 0)
-            # row.append(0 if emashort[-2].ema < emalong[-2].ema and emashort[-1].ema > emalong[-1].ema and get_value(
-            #     quotes[-1]) > get_value(quotes[-2]) > get_value(quotes[-3]) else 1)
-            row.append(1 if awesome_oscillator[i].oscillator >= 0 else 0)
-            row.append(1 if psar[i].is_reversal else 0)
-            row.append(1 if cci[i].cci <= 0 else 0)
-            row.append(1 if macd[i].macd >= macd[i].signal else 0)
-            if only_last_row:
-                return [row]
-            row.append(1 if get_value(quotes[i + TIME]) <= get_value(quotes[i]) else 0)  # profit
-            # print(f"Row length: {len(row)}")
-            data.append(row)
-        except:
-            pass
-    print('len data', len(data))
-    return data
-
-
-def check_data():
-    quotes = get_quotes(CANDLES)
-
-    data = get_data(quotes[-200:])
-    df = pd.DataFrame(data, columns=HEADER)
-    X = df.iloc[:, :len(HEADER) - 1]
-    y = df['profit']
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-    model = RandomForestClassifier(n_estimators=400)
-    model.fit(X_train, y_train)
-    y_pred = model.predict(X_test)
-    model_accuracy = accuracy_score(y_test, y_pred)
-    last = pd.DataFrame(get_data(quotes, only_last_row=True), columns=HEADER[:-1])
-    probe = model.predict_proba(last)
-    print('Model accuracy:', round(model_accuracy, 2),
-          'PUT probability:', round(probe[0][0], 2),
-          'CALL probability:', round(probe[0][1], 2))
-
-    # if model_accuracy > 0.50:
-    if probe[0][0] > 0.60:
-        do_action('put')
-    elif probe[0][1] > 0.60:
-        do_action('call')
-    else:
-        print(quotes[-1].date, 'working...')
-
-
-def _debug_report():
-    import time
-    _DEBUG_STATS['loops'] += 1
-    now = time.time()
-    if now - _DEBUG_STATS['last_report'] < 10:
+    if text == src:
+        print('\nNothing to write.')
         return
-    _DEBUG_STATS['last_report'] = now
-    print(f"[status] loops={_DEBUG_STATS['loops']}  "
-          f"log_entries={_DEBUG_STATS['log_entries']}  "
-          f"opcode2={_DEBUG_STATS['opcode2']}  "
-          f"decoded={_DEBUG_STATS['decoded']}  "
-          f"candle_updates={_DEBUG_STATS['candle_updates']}  "
-          f"currency={CURRENCY!r}  "
-          f"candles={len(CANDLES)}")
 
+    shutil.copyfile(PATH, PATH + '.bak')
+    with open(PATH, 'w', newline='') as f:
+        f.write(text)
 
-def websocket_log():
-    global CURRENCY, CURRENCY_CHANGE, CURRENCY_CHANGE_DATE, LAST_REFRESH, PERIOD, CANDLES
-    _debug_report()
-    try:
-        current_symbol = driver.find_element(by=By.CLASS_NAME, value='current-symbol').text
-        if current_symbol != CURRENCY:
-            CURRENCY = current_symbol
-            CURRENCY_CHANGE = True
-            CURRENCY_CHANGE_DATE = datetime.now()
-            print(f'[status] currency changed to {current_symbol!r}')
-    except Exception:
-        pass
-
-    if CURRENCY_CHANGE and CURRENCY_CHANGE_DATE < datetime.now() - timedelta(seconds=5):
-        driver.refresh()  # refresh page to cut off unwanted signals
-        CURRENCY_CHANGE = False
-        CANDLES = []
-        PERIOD = 0
-
-    try:
-        entries = driver.get_log('performance')
-    except Exception as e:
-        print(f'[status] get_log failed: {e}')
-        return
-    _DEBUG_STATS['log_entries'] += len(entries)
-
-    for wsData in entries:
-        message = json.loads(wsData['message'])['message']
-        response = message.get('params', {}).get('response', {})
-        if response.get('opcode', 0) == 2 and not CURRENCY_CHANGE:
-            _DEBUG_STATS['opcode2'] += 1
-            payload_str = base64.b64decode(response['payloadData']).decode('utf-8')
-            try:
-                data = json.loads(payload_str)
-                _DEBUG_STATS['decoded'] += 1
-            except Exception:
-                continue
-            if 'asset' in data and 'candles' in data:  # 5m
-                PERIOD = data['period']
-                CANDLES = list(reversed(data['candles']))  # timestamp open close high low
-                CANDLES.append([CANDLES[-1][0] + PERIOD, CANDLES[-1][1], CANDLES[-1][2], CANDLES[-1][3], CANDLES[-1][4]])
-                for tstamp, value in data['history']:
-                    tstamp = int(float(tstamp))
-                    CANDLES[-1][2] = value  # set close all the time
-                    if value > CANDLES[-1][3]:  # set high
-                        CANDLES[-1][3] = value
-                    elif value < CANDLES[-1][4]:  # set low
-                        CANDLES[-1][4] = value
-                    if tstamp % PERIOD == 0:
-                        if tstamp not in [c[0] for c in CANDLES]:
-                            CANDLES.append([tstamp, value, value, value, value])
-                print('Got', len(CANDLES), 'candles for', data['asset'])
-            try:
-                current_value = data[0][2]
-                CANDLES[-1][2] = current_value  # set close all the time
-                if current_value > CANDLES[-1][3]:  # set high
-                    CANDLES[-1][3] = current_value
-                elif current_value < CANDLES[-1][4]:  # set low
-                    CANDLES[-1][4] = current_value
-                tstamp = int(float(data[0][1]))
-                if tstamp % PERIOD == 0:
-                    if tstamp not in [c[0] for c in CANDLES]:
-                        try:
-                            check_data()
-                        except Exception as e:
-                            print(e)
-                        CANDLES.append([tstamp, current_value, current_value, current_value, current_value])
-            except:
-                pass
+    print(f'\nWritten. Backup: {PATH}.bak\n\nWhat changed, in plain English:')
+    for r in results:
+        if r[1] == 'applied':
+            print(f'  - {r[0]}: {r[2]}')
+    print('\nRestart the bot to pick it up.')
 
 
 if __name__ == '__main__':
-    load_web_driver()
-    import time as _t
-    print('[status] waiting for data... (log in to PO and open the demo trade room)')
-    while True:
-        websocket_log()
-        _t.sleep(0.25)  # was a tight loop, hammering CPU and the perf-log API
+    main()

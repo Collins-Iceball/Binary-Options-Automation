@@ -98,7 +98,24 @@ QT_TOTAL_PROFIT = 0.0
 QT_RUN_FINISHED = False       # True once sessions target or TP is reached; main() breaks out on this
 QT_MODE_CHECKED_ONCE = False  # only force-check the $/% toggle once per run, not every tick
 QT_ASSET_SYNCED = False       # True once the bot has learned which chart is on screen at startup
+QT_RUNTIME = {}               # runtime-only values: 'expiry' = the expiry last confirmed on the page, in seconds
+
+# --- Quick Trade timeframe match (only active when the GUI checkbox is ticked) ---
+QT_TF_MAX_RATIO = 1.5         # chart candle may be at most this many times the expiry (60s candles on a 30s expiry = too coarse)
+QT_TF_MIN_CANDLES = 8         # minimum analysis candles after merging (slow MA + 2 is used when that is larger)
+QT_TF_BLOCK = True            # True = wait at session start when the timeframe does not fit, False = only warn and carry on
+QT_TF_LOG_EVERY = 15          # seconds between timeframe log lines
+QT_TF_LAST_LOG = datetime(2000, 1, 1)
+
+# --- Quick Trade choppy-market filter (only active when the GUI checkbox is ticked) ---
+QT_CHOP_N = 10                # how many candles of the chart to look at
+QT_CHOP_ER_MIN = 0.30         # efficiency ratio below this = chop (1.0 = straight line, ~0.3 = random walk)
+QT_CHOP_FLIPS_MAX = 7         # candle-colour changes (out of N-1) at or above this = zig-zag
+QT_CHOP_LOG_EVERY = 15        # seconds between 'waiting for a cleaner market' log lines
+QT_CHOP_LAST_LOG = datetime(2000, 1, 1)
 QT_AUTO_CONTINUE = False      # set once the user picks 'A' - skips future Y/N/A prompts entirely
+QT_ENTRY_PRICE = None         # live price of the session asset at the moment the last order fired
+QT_ENTRY_ASSET = None         # asset that entry price belongs to (a chart switch invalidates it)
 
 # --- Normal-mode smart filters (Quick Trade ignores these) ---
 NORMAL_LOSS_COOLDOWN_UNTIL = datetime(2000, 1, 1)
@@ -243,6 +260,8 @@ async def websocket_log(driver):
                     # print('Current asset:', CURRENT_ASSET)
                 if PERIOD != data['period']:
                     # time is changed, refresh
+                    log(f"Chart timeframe is now {data['period']}s" +
+                        (f' (was {PERIOD}s), analysis follows the new timeframe' if CANDLES else ''))
                     PERIOD = data['period']
                     CANDLES = {}
                     ACTIONS = {}
@@ -326,17 +345,47 @@ async def reanimate_favorites(driver):
                 break
 
 
+def asset_key_from_label(label, known):
+    # Chart-header label -> asset id. 'NZD/USD OTC' -> 'NZDUSD_otc', 'EUR/USD' -> 'EURUSD'.
+    # An id the bot already has candles for wins (matched ignoring case and punctuation);
+    # otherwise the derived id is returned so the caller can see the chart changed and wait
+    # for that chart's history to arrive.
+    label = str(label or '').strip()
+    if not label:
+        return None
+    norm = ''.join(ch for ch in label.lower() if ch.isalnum())
+    for key in known:
+        if ''.join(ch for ch in str(key).lower() if ch.isalnum()) == norm:
+            return key
+    is_otc = label.upper().endswith('OTC')
+    base = label[:-3] if is_otc else label
+    guess = ''.join(ch for ch in base if ch.isalnum()).upper()
+    if not guess:
+        return None
+    return guess + '_otc' if is_otc else guess
+
+
 async def read_active_asset(driver):
     """The chart that is on screen right now, e.g. 'AUDUSD_otc' - the active tab in the favorites
     strip (same element switch_to_asset clicks). One cheap browser call. None if the strip isn't
     there. CURRENT_ASSET only ever changed when the BOT switched charts, so it went stale the
     moment a human clicked another chart."""
     try:
-        return driver.execute_script(
-            "var e = document.querySelector('.assets-favorites-item--active');"
-            "return e ? e.getAttribute('data-id') : null;")
+        found = driver.execute_script(
+            "var a = document.querySelector('.assets-favorites-item--active');"
+            "var s = document.querySelector('.current-symbol');"
+            "return [a ? a.getAttribute('data-id') : null,"
+            "        s ? (s.innerText || s.textContent || '').trim() : null];")
     except Exception:
         return None
+    if not found:
+        return None
+    strip_id, label = found[0], found[1]
+    if strip_id:
+        return strip_id  # exact id from the favorites strip, same as before
+    # The chart on screen is not a favorites tab (picked from the asset list, or the strip is
+    # closed): fall back to the symbol label in the chart header, e.g. 'NZD/USD OTC'.
+    return asset_key_from_label(label, list(CANDLES.keys()))
 
 
 async def switch_to_asset(driver, asset):
@@ -514,6 +563,186 @@ async def quick_trade_ma_direction(candles):
     return None
 
 
+async def quick_trade_fast_direction(candles):
+    # Faster read used after a loss: a short MA (half the Quick Trade fast period) versus the
+    # Quick Trade fast MA, by current POSITION (same idea as quick_trade_ma_direction, but it
+    # reacts within a few candles). Returns 'call' / 'put' / None.
+    fast_ma = int(SETTINGS.get('QT_FAST_MA', 5))
+    ma_type = SETTINGS.get('QT_MA_TYPE', 'SMA')
+    short_ma = max(2, fast_ma // 2)
+    long_ma = max(short_ma + 1, fast_ma)
+    candles, _ = quick_trade_analysis_candles(candles, strict=False)
+    try:
+        quotes = candles_to_quotes(candles)
+        _, short_curr = get_ma_last_two(quotes, ma_type, short_ma)
+        _, long_curr = get_ma_last_two(quotes, ma_type, long_ma)
+        if short_curr > long_curr:
+            return 'call'
+        elif short_curr < long_curr:
+            return 'put'
+    except Exception as e:
+        log(e)
+    return None
+
+
+def quick_trade_price_move(asset):
+    # Which way price went since the last Quick Trade order fired: 'call' = rose, 'put' = fell.
+    # None when there is no entry price, the chart changed, or price is basically flat.
+    if QT_ENTRY_PRICE is None or QT_ENTRY_ASSET != asset:
+        return None
+    candles = CANDLES.get(asset)
+    if not candles:
+        return None
+    try:
+        price_now = float(candles[-1][2])
+    except Exception:
+        return None
+    move = price_now - QT_ENTRY_PRICE
+    if abs(move) <= abs(QT_ENTRY_PRICE) * 1e-6:
+        return None  # flat - nothing worth following
+    return 'call' if move > 0 else 'put'
+
+
+async def quick_trade_direction_after_loss(prev_direction, asset):
+    # Direction for the next martingale step after a LOSS.
+    # Reverse toggle (still stored as QT_FOLLOW_PRICE_MOVE): the broker's LOSS verdict already says
+    # price finished on the wrong side of our entry, so the opposite direction IS the way price just
+    # moved - no candle comparison.
+    # Reverse OUTRANKS the fast read: with both on this is a plain reverse, the fast read is ignored.
+    # Fast read toggle (only used when reverse is off): short MA vs fast MA position.
+    # Both off -> returns prev_direction untouched (the original behaviour).
+    reverse_on = bool(SETTINGS.get('QT_FOLLOW_PRICE_MOVE', False))
+    fast_on = bool(SETTINGS.get('QT_RECHECK_FAST', False))
+    if not (reverse_on or fast_on) or prev_direction not in ('call', 'put'):
+        return prev_direction
+    new_direction = None
+    source = ''
+    if reverse_on:
+        new_direction = 'put' if prev_direction == 'call' else 'call'
+        source = 'reverse after loss'
+    else:
+        candles = CANDLES.get(asset)
+        if candles:
+            new_direction = await quick_trade_fast_direction(candles)
+            if new_direction:
+                source = 'fast read'
+    if new_direction is None:
+        new_direction = prev_direction
+        source = 'no clear read, keeping direction'
+    log(f'Quick Trade: after loss, direction {dir_emo(prev_direction)} {prev_direction} -> '
+        f'{dir_emo(new_direction)} {new_direction} ({source})')
+    return new_direction
+
+
+def quick_trade_regime_check(candles, direction):
+    # Is the market clean enough to trust the MA direction? Returns (ok, reason).
+    # Looks at the last QT_CHOP_N candles of the chart:
+    #  - efficiency ratio (ER): net move / total distance travelled. 1 = straight line, 0 = pure chop
+    #  - colour flips: how often consecutive CLOSED candles change colour (green-red-green zig-zag)
+    #  - agreement: the MA direction has to match the net price move over the same window
+    # On any error it lets the trade through (same fail-open style as the payout check).
+    try:
+        n = int(QT_CHOP_N)
+        recent = candles[-(n + 1):]
+        if len(recent) < n + 1:
+            return False, 'not enough candles yet'
+        closes = [float(c[2]) for c in recent]
+        path = sum(abs(closes[i] - closes[i - 1]) for i in range(1, len(closes)))
+        net = closes[-1] - closes[0]
+        er = abs(net) / path if path > 0 else 0.0
+        colours = []
+        for c in recent[:-1]:  # the last candle is still forming, its colour flickers
+            o, cl = float(c[1]), float(c[2])
+            if cl > o:
+                colours.append(1)
+            elif cl < o:
+                colours.append(-1)
+        flips = sum(1 for i in range(1, len(colours)) if colours[i] != colours[i - 1])
+        steps = max(len(colours) - 1, 0)
+        move_dir = 'call' if net > 0 else 'put' if net < 0 else None
+        detail = f'ER {er:.2f}, colour flips {flips}/{steps}'
+        if er < QT_CHOP_ER_MIN:
+            return False, f'choppy ({detail})'
+        if flips >= QT_CHOP_FLIPS_MAX:
+            return False, f'zig-zag ({detail})'
+        if move_dir != direction:
+            return False, f'MA says {direction} but price moved {move_dir} ({detail})'
+        return True, detail
+    except Exception as e:
+        log(e)
+        return True, 'regime check failed, not blocking'
+
+
+def quick_trade_log_chop_wait(blocked):
+    # throttled 'why am I not entering' line, so the console is not spammed every second
+    global QT_CHOP_LAST_LOG
+    if not blocked:
+        return
+    now = datetime.now()
+    if (now - QT_CHOP_LAST_LOG).total_seconds() >= QT_CHOP_LOG_EVERY:
+        QT_CHOP_LAST_LOG = now
+        log('Quick Trade: waiting for a cleaner market - ' + ' | '.join(blocked[:3]))
+
+
+def merge_candles(candles, m):
+    # Merge every m consecutive candles into one: [ts, open, close, high, low] like CANDLES.
+    # Groups are counted back from the newest candle, so the last merged candle always ends on the
+    # live one; an older leftover group that is not full is dropped.
+    groups = []
+    end = len(candles)
+    while end - m >= 0:
+        groups.append(candles[end - m:end])
+        end -= m
+    groups.reverse()
+    return [[g[0][0], g[0][1], g[-1][2], max(float(c[3]) for c in g), min(float(c[4]) for c in g)]
+            for g in groups]
+
+
+def quick_trade_analysis_candles(candles, strict=True):
+    # Matches the analysis candles to the trade expiry. Returns (candles_to_analyse, note).
+    #  - chart candle <= expiry: merge m = round(expiry / chart candle) chart candles into one, so one
+    #    analysis candle is about one expiry long (30s chart on a 10 min expiry -> 20 merged)
+    #  - chart candle more than QT_TF_MAX_RATIO x the expiry: too coarse (a 1 min chart cannot give
+    #    30s candles). strict + QT_TF_BLOCK -> (None, note), otherwise the raw candles + the note
+    #  - not enough history left after merging for the slow MA: handled the same way
+    # Checkbox off, or chart timeframe / expiry unknown -> candles untouched.
+    if not SETTINGS.get('QT_TF_MATCH', False):
+        return candles, ''
+    try:
+        period = int(PERIOD)
+        expiry = int(QT_RUNTIME.get('expiry') or SETTINGS.get('QT_EXPIRY_SECONDS') or 0)
+        if period <= 0 or expiry <= 0 or not candles:
+            return candles, ''
+        fallback = None if (strict and QT_TF_BLOCK) else candles
+        if period > expiry * QT_TF_MAX_RATIO:
+            fine = [p for p in (5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600)
+                    if p <= expiry * QT_TF_MAX_RATIO]
+            hint = (f'switch the chart to {fine[-1]}s or finer' if fine
+                    else 'no chart timeframe is fine enough for this expiry')
+            return fallback, f'chart candles are {period}s but the trade expires in {expiry}s: too coarse, {hint}'
+        m = max(1, int(round(expiry / period)))
+        merged = candles if m == 1 else merge_candles(candles, m)
+        need = max(int(SETTINGS.get('QT_SLOW_MA', 10)) + 2, QT_TF_MIN_CANDLES)
+        if len(merged) < need:
+            return fallback, (f'only {len(merged)} candles of ~{period * m}s available (need {need}): '
+                              f'chart is {period}s for a {expiry}s expiry, use a coarser chart timeframe')
+        return merged, ''
+    except Exception as e:
+        log(e)
+        return candles, ''
+
+
+def quick_trade_log_tf_note(note):
+    # throttled, so a timeframe / expiry mismatch is explained without spamming the console
+    global QT_TF_LAST_LOG
+    if not note:
+        return
+    now = datetime.now()
+    if (now - QT_TF_LAST_LOG).total_seconds() >= QT_TF_LOG_EVERY:
+        QT_TF_LAST_LOG = now
+        log('Quick Trade timeframe match: ' + note)
+
+
 async def set_quick_trade_expiry(driver):
     """Force the expiry field to SETTINGS['QT_EXPIRY_SECONDS'] (default 5) and verify it
     actually landed. Returns the confirmed expiry in seconds, or None on failure.
@@ -521,7 +750,7 @@ async def set_quick_trade_expiry(driver):
     a fixed number regardless of what's really on screen causes the bot to check results
     (and re-fire/close a session) before a longer trade has actually closed."""
     target_seconds = int(SETTINGS.get('QT_EXPIRY_SECONDS', 5))
-    target_seconds = max(5, target_seconds)  # platform floor - Quick Trade spec's default is 5s
+    target_seconds = max(3, target_seconds)  # floor lowered to 3s on request (was 5s)
     target_str = f'00:00:{target_seconds:02d}' if target_seconds < 60 else \
         f'00:{target_seconds // 60:02d}:{target_seconds % 60:02d}'
     try:
@@ -975,7 +1204,7 @@ async def check_quick_trade(driver):
     global QT_SESSION_COUNT, QT_SESSION_ACTIVE, QT_DIRECTION, QT_STEP, QT_BASE_AMOUNT, \
         QT_LAST_ACTION_ENDS_AT, QT_TRADE_BALANCE_BEFORE, QT_TRADE_BET_AMOUNT, QT_AMOUNT_SET, QT_TP_HIT, \
         QT_SESSION_ASSET, QT_SESSION_START_BALANCE, QT_TOTAL_PROFIT, QT_RUN_FINISHED, QT_MODE_CHECKED_ONCE, \
-        QT_AUTO_CONTINUE, CURRENT_ASSET, QT_ASSET_SYNCED
+        QT_AUTO_CONTINUE, CURRENT_ASSET, QT_ASSET_SYNCED, QT_ENTRY_PRICE, QT_ENTRY_ASSET
 
     if QT_AUTO_CONTINUE:
         total_sessions = 5  # auto-continue always runs shorter cycles, regardless of the saved GUI setting
@@ -1068,6 +1297,8 @@ async def check_quick_trade(driver):
                 QT_AMOUNT_SET = True
                 return
             QT_STEP += 1
+            # post-loss direction rule (both toggles off = unchanged: same direction re-fires)
+            QT_DIRECTION = await quick_trade_direction_after_loss(QT_DIRECTION, QT_SESSION_ASSET)
         else:
             pass  # DRAW: QT_STEP untouched on purpose - same amount re-fires, no martingale applied
         QT_AMOUNT_SET = True
@@ -1102,14 +1333,26 @@ async def check_quick_trade(driver):
     if not QT_SESSION_ACTIVE:
         direction = None
         chosen_asset = None
+        _chop_blocked = []
         # try the chart the user is on first, then the rest in their usual order (sort is stable)
         _on_screen = screen_asset or CURRENT_ASSET
         for asset, candles in sorted(CANDLES.items(), key=lambda kv: kv[0] != _on_screen):
+            candles, _tf_note = quick_trade_analysis_candles(candles)
+            quick_trade_log_tf_note(_tf_note)
+            if candles is None:
+                continue
             direction = await quick_trade_ma_direction(candles)
+            if direction and SETTINGS.get('QT_CHOP_FILTER', False):
+                _regime_ok, _regime_why = quick_trade_regime_check(candles, direction)
+                if not _regime_ok:
+                    _chop_blocked.append(f'{asset}: {_regime_why}')
+                    direction = None
+                    continue
             if direction:
                 chosen_asset = asset
                 break
         if not direction:
+            quick_trade_log_chop_wait(_chop_blocked)
             return
         QT_DIRECTION = direction
         QT_SESSION_ASSET = chosen_asset  # lock this asset for the whole session - direction and order must agree
@@ -1122,7 +1365,9 @@ async def check_quick_trade(driver):
         return
     if QT_DIRECTION is None:
         # only after following the user mid-martingale: read the new chart's MA before firing
-        QT_DIRECTION = await quick_trade_ma_direction(CANDLES[asset])
+        _tf_candles, _tf_note = quick_trade_analysis_candles(CANDLES[asset], strict=False)
+        quick_trade_log_tf_note(_tf_note)
+        QT_DIRECTION = await quick_trade_ma_direction(_tf_candles)
         if QT_DIRECTION is None:
             return
 
@@ -1179,6 +1424,7 @@ async def check_quick_trade(driver):
     if confirmed_expiry_seconds is None:
         log('Quick Trade: could not confirm expiry, aborting this re-fire attempt.')
         return
+    QT_RUNTIME['expiry'] = confirmed_expiry_seconds
 
     _bal_before_trade = await get_balance(driver)
     order_created = await create_order(driver, QT_DIRECTION, asset, skip_cooldown=True)
@@ -1766,6 +2012,10 @@ def tkinter_run():
     qt_tp_val = ctk.StringVar(value=str(SETTINGS.get('QT_TAKE_PROFIT', 100)))
     qt_min_payout_val = ctk.StringVar(value=str(SETTINGS.get('QT_MIN_PAYOUT', 50)))
     qt_expiry_val = ctk.StringVar(value=str(SETTINGS.get('QT_EXPIRY_SECONDS', 5)))
+    chk_qt_tf_var = ctk.IntVar(value=1 if SETTINGS.get('QT_TF_MATCH', False) else 0)
+    chk_qt_recheck_var = ctk.IntVar(value=1 if SETTINGS.get('QT_RECHECK_FAST', False) else 0)
+    chk_qt_follow_var = ctk.IntVar(value=1 if SETTINGS.get('QT_FOLLOW_PRICE_MOVE', False) else 0)
+    chk_qt_chop_var = ctk.IntVar(value=1 if SETTINGS.get('QT_CHOP_FILTER', False) else 0)
 
     chk_rsi_var = ctk.IntVar(value=1 if SETTINGS.get('RSI_ENABLED', False) else 0)
     chk_supertrend_var = ctk.IntVar(value=1 if SETTINGS.get('SUPERTREND_ENABLED', False) else 0)
@@ -1986,6 +2236,18 @@ def tkinter_run():
     L(quick_content, 'Expiry (sec)').grid(row=r, column=0, sticky='w')
     ent_qt_expiry = E(quick_content, qt_expiry_val, width=72)
     ent_qt_expiry.grid(row=r, column=2, sticky='e', pady=2)
+    r += 1
+    CH(quick_content, chk_qt_tf_var, 'Match analysis to chart timeframe + expiry').grid(
+        row=r, column=0, columnspan=3, sticky='w', pady=4)
+    r += 1
+    CH(quick_content, chk_qt_recheck_var, 'After loss: fast read (used only if reverse is off)').grid(
+        row=r, column=0, columnspan=3, sticky='w', pady=4)
+    r += 1
+    CH(quick_content, chk_qt_follow_var, 'After loss: reverse direction').grid(
+        row=r, column=0, columnspan=3, sticky='w', pady=4)
+    r += 1
+    CH(quick_content, chk_qt_chop_var, 'Session start: skip choppy / conflicting market').grid(
+        row=r, column=0, columnspan=3, sticky='w', pady=4)
 
     # ---- widget group lists for mode toggle ----
     qt_normal_widgets = [
@@ -2111,6 +2373,21 @@ def tkinter_run():
             return False
         return min_ <= int(v) <= max_
 
+    def validate_amount(value, min_=1, max_=20000):
+        # whole number or decimal with at most 2 decimals: 1, 1.1, 2.35 (a comma works as the dot)
+        v = str(value).strip().replace(',', '.')
+        parts = v.split('.')
+        if len(parts) > 2 or not parts[0].isdigit():
+            return False
+        if len(parts) == 2 and (not parts[1].isdigit() or len(parts[1]) > 2):
+            return False
+        return min_ <= float(v) <= max_
+
+    def parse_amount(value):
+        # '5' -> 5 (int), '1.1' -> 1.1 (float): whole numbers stay whole in settings.txt
+        amount = round(float(str(value).strip().replace(',', '.')), 2)
+        return int(amount) if amount.is_integer() else amount
+
     def validate_list(value):
         try:
             cleanup_martingale_list(value)
@@ -2181,8 +2458,8 @@ def tkinter_run():
                 error_variable.set('Quick Trade Slow MA: should be number 2-200'); return
             if int(qt_fast_ma_val.get()) >= int(qt_slow_ma_val.get()):
                 error_variable.set('Quick Trade: Fast MA must be less than Slow MA'); return
-            if not validate_int(qt_amount_val.get(), 1, 20000):
-                error_variable.set('Quick Trade amount: should be number 1-20000'); return
+            if not validate_amount(qt_amount_val.get(), 1, 20000):
+                error_variable.set('Quick Trade amount: should be a number 1-20000, up to 2 decimals (e.g. 1.1)'); return
             try:
                 if float(qt_mart_val.get()) <= 1:
                     raise ValueError
@@ -2196,8 +2473,8 @@ def tkinter_run():
                 error_variable.set('Quick Trade take profit: should be number 1-20000'); return
             if not validate_int(qt_min_payout_val.get(), 1, 92):
                 error_variable.set('Quick Trade min payout: should be number 1-92'); return
-            if not validate_int(qt_expiry_val.get(), 5, 3600):
-                error_variable.set('Quick Trade expiry: should be number 5-3600 (seconds)'); return
+            if not validate_int(qt_expiry_val.get(), 3, 3600):
+                error_variable.set('Quick Trade expiry: should be number 3-3600 (seconds)'); return
 
         save_settings(
             STRATEGY=radio_var.get(),
@@ -2240,7 +2517,7 @@ def tkinter_run():
             QT_FAST_MA=int(qt_fast_ma_val.get()),
             QT_SLOW_MA=int(qt_slow_ma_val.get()),
             QT_MA_TYPE=qt_fast_ma_type.get(),
-            QT_TRADE_AMOUNT=int(qt_amount_val.get()),
+            QT_TRADE_AMOUNT=parse_amount(qt_amount_val.get()),
             QT_MARTINGALE=float(qt_mart_val.get()),
             QT_MAX_STEPS=int(qt_max_steps_val.get()),
             QT_SESSIONS=int(qt_sessions_val.get()) if int(qt_sessions_val.get()) >= 10 else 10,
@@ -2248,6 +2525,10 @@ def tkinter_run():
             QT_TAKE_PROFIT=int(qt_tp_val.get()) if chk_qt_tp_var.get() else SETTINGS.get('QT_TAKE_PROFIT', 100),
             QT_MIN_PAYOUT=int(qt_min_payout_val.get()),
             QT_EXPIRY_SECONDS=int(qt_expiry_val.get()),
+            QT_TF_MATCH=True if chk_qt_tf_var.get() else False,
+            QT_RECHECK_FAST=True if chk_qt_recheck_var.get() else False,
+            QT_FOLLOW_PRICE_MOVE=True if chk_qt_follow_var.get() else False,
+            QT_CHOP_FILTER=True if chk_qt_chop_var.get() else False,
         )
         window.destroy()
 
